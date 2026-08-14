@@ -3,10 +3,12 @@
 
 use std::fmt;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use volta_frontend::ast::{Function, Module, TopLevelItem, VarDecl};
 
+use crate::canon::parent_counts;
 use crate::equiv::{DEFAULT_RECYCLE_TERMS, EquivError, EquivSession};
 use crate::eval::{AnalysisConfig, AnalysisOutput, EvalError, Interpreter, Stats};
 use crate::logging::info;
@@ -174,6 +176,23 @@ pub struct EquivCheckOptions {
     /// only. Per-iteration timings land in
     /// [`EquivCheckReport::check_iters`].
     pub iterations: NonZeroUsize,
+    /// Solve the element list on this many worker threads (default 1:
+    /// one session checks every element, the historical serial loop).
+    /// The sampled elements are split into contiguous chunks, one
+    /// worker with its own private `EquivSession` per chunk. Per-element
+    /// verdicts are independent of session state (the same property the
+    /// `iterations` agreement check rests on), so the partition cannot
+    /// change them; contiguity keeps row-local shared structure (an
+    /// attention row's softmax denominator) inside one session, so only
+    /// structure straddling a chunk boundary is re-canonicalized.
+    /// `recycle_terms` remains the *aggregate* memory cap: each worker
+    /// recycles at `recycle_terms / workers` (at least 1). Each worker
+    /// session also gets its own canon term-op budget. Under
+    /// parallelism > 1 the summed [`EquivCheckReport::check_iters`]
+    /// spans run concurrently - they include cross-worker contention
+    /// and exceed wall clock ([`EquivCheckReport::wall_iters`]); keep 1
+    /// for timings comparable across backends and to the paper's.
+    pub parallelism: NonZeroUsize,
 }
 
 impl Default for EquivCheckOptions {
@@ -183,6 +202,7 @@ impl Default for EquivCheckOptions {
             verify_numeric: false,
             recycle_terms: DEFAULT_RECYCLE_TERMS,
             iterations: NonZeroUsize::MIN,
+            parallelism: NonZeroUsize::MIN,
         }
     }
 }
@@ -218,6 +238,14 @@ pub struct EquivCheckReport {
     /// measurements `check_iters[0]` accumulates, not extra timing work -
     /// so carrying them does not move the iteration totals.
     pub element_checks: Vec<ElementCheckTime>,
+    /// Per-iteration wall-clock time of the whole element pass (worker
+    /// spawn through join; iteration 1's span includes any oracle
+    /// confirmations, which run inside the workers). At
+    /// [`EquivCheckOptions::parallelism`] 1 this tracks `check_iters`;
+    /// above 1 it is the honest elapsed number, while `check_iters`
+    /// stays the summed backend-comparable measure. One entry per
+    /// iteration, aligned with `check_iters`.
+    pub wall_iters: Vec<Duration>,
     /// Time spent pairing the two footprints (`paired_elements`). Callers
     /// that account "VC generation" as symbolic execution plus pairing
     /// (the bench harness) add this to their execution time.
@@ -356,12 +384,136 @@ fn check_iteration_agreement(
     })
 }
 
+/// What a solve iteration does per element beyond the decision check
+/// itself - iteration 1 produces the verdicts (and confirms them with the
+/// oracle when enabled); later iterations must reproduce them.
+#[derive(Clone, Copy)]
+enum IterationRole<'a> {
+    First { verify_numeric: bool },
+    Later {
+        iteration: usize,
+        first_verdicts: &'a [bool],
+    },
+}
+
+/// One element's product inside a solve iteration.
+struct SlotOutcome {
+    equivalent: bool,
+    /// The `EquivSession::check` duration (what `check_iters` sums).
+    check: Duration,
+    /// The oracle confirmation's duration (`IterationRole::First` with
+    /// `verify_numeric` only).
+    verify: Option<Duration>,
+}
+
+/// One element's work inside a solve iteration: the timed decision check,
+/// then either the oracle confirmation (iteration 1) or the agreement
+/// check against iteration 1's verdict (later iterations).
+fn check_element(
+    session: &mut EquivSession<'_>,
+    reference: &AnalysisOutput,
+    optimized: &AnalysisOutput,
+    role: IterationRole<'_>,
+    slot: usize,
+    element: (&str, u64, ExprId, ExprId),
+) -> Result<SlotOutcome, EquivCheckError> {
+    let (array, index, r, o) = element;
+    let check_start = Instant::now();
+    let equivalent = session.check(r, o)?;
+    let check = check_start.elapsed();
+    let mut verify = None;
+    match role {
+        IterationRole::First { verify_numeric } => {
+            if verify_numeric {
+                let verify_start = Instant::now();
+                numeric::verify_verdict(&reference.arena, r, &optimized.arena, o, equivalent)
+                    .map_err(|message| EquivCheckError::Numeric {
+                        message: format!("array '{}' element {}: {}", array, index, message),
+                    })?;
+                verify = Some(verify_start.elapsed());
+            }
+        }
+        IterationRole::Later {
+            iteration,
+            first_verdicts,
+        } => {
+            check_iteration_agreement(first_verdicts[slot], equivalent, array, index, iteration)?;
+        }
+    }
+    Ok(SlotOutcome {
+        equivalent,
+        check,
+        verify,
+    })
+}
+
+/// One solve iteration over the sampled elements: contiguous chunks of
+/// `chunk_size` elements, one worker thread with its own `EquivSession`
+/// per chunk (see `EquivCheckOptions::parallelism`). Returns one slot per
+/// element, in element order; a worker stops its chunk at its first
+/// error (matching the serial loop, which never checks past an error),
+/// leaving that chunk's later slots empty, so scanning the slots in
+/// order reaches the lowest-slot error before any empty slot.
+fn run_solve_iteration(
+    reference: &AnalysisOutput,
+    optimized: &AnalysisOutput,
+    checked: &[(&str, u64, ExprId, ExprId)],
+    counts: (&Arc<Vec<u32>>, &Arc<Vec<u32>>),
+    worker_recycle: usize,
+    chunk_size: usize,
+    role: IterationRole<'_>,
+) -> Vec<Option<Result<SlotOutcome, EquivCheckError>>> {
+    let mut slots: Vec<Option<Result<SlotOutcome, EquivCheckError>>> = Vec::new();
+    slots.resize_with(checked.len(), || None);
+    std::thread::scope(|scope| {
+        for (chunk_index, (elements, outcomes)) in checked
+            .chunks(chunk_size)
+            .zip(slots.chunks_mut(chunk_size))
+            .enumerate()
+        {
+            let (counts1, counts2) = counts;
+            std::thread::Builder::new()
+                .name(format!("vc-solve-{}", chunk_index))
+                .spawn_scoped(scope, move || {
+                    let mut session = EquivSession::with_shared_counts(
+                        &reference.arena,
+                        &optimized.arena,
+                        worker_recycle,
+                        Arc::clone(counts1),
+                        Arc::clone(counts2),
+                    );
+                    let base = chunk_index * chunk_size;
+                    for (offset, (&element, outcome)) in
+                        elements.iter().zip(outcomes.iter_mut()).enumerate()
+                    {
+                        let result = check_element(
+                            &mut session,
+                            reference,
+                            optimized,
+                            role,
+                            base + offset,
+                            element,
+                        );
+                        let stop = result.is_err();
+                        *outcome = Some(result);
+                        if stop {
+                            return;
+                        }
+                    }
+                })
+                .expect("spawning a VC solver thread");
+        }
+    });
+    slots
+}
+
 /// Check two analysis outputs element by element under `options`. Within
-/// one solve iteration a single `EquivSession` is shared across all
-/// elements, so structure shared between elements (and between the two
-/// kernels) canonicalizes once; each further iteration (see
-/// `EquivCheckOptions::iterations`) re-solves the same sampled elements
-/// from a fresh session.
+/// one solve iteration each worker's `EquivSession` is shared across all
+/// its elements (one worker checks everything at the default
+/// `parallelism` of 1), so structure shared between elements (and between
+/// the two kernels) canonicalizes once per worker; each further iteration
+/// (see `EquivCheckOptions::iterations`) re-solves the same sampled
+/// elements from fresh sessions.
 pub fn check_output_equivalence_with(
     reference: &AnalysisOutput,
     optimized: &AnalysisOutput,
@@ -378,45 +530,73 @@ pub fn check_output_equivalence_with(
     let elements_total: u64 = paired.iter().map(|(_, common)| common.len() as u64).sum();
     let checked = sampled_elements(&paired, options.sample);
 
+    // Parent counts once per call: every worker session in every
+    // iteration (and every recycle) shares these two computations.
+    let counts1 = Arc::new(parent_counts(&reference.arena));
+    let counts2 = Arc::new(parent_counts(&optimized.arena));
+
+    // The partition, fixed across iterations so each one redoes identical
+    // work: `workers` contiguous chunks, and the aggregate recycle cap
+    // split evenly so total warm memory stays what `recycle_terms` says.
+    let workers = options.parallelism.get().min(checked.len().max(1));
+    let chunk_size = checked.len().div_ceil(workers).max(1);
+    let worker_recycle = match options.recycle_terms {
+        0 => 0,
+        cap => (cap / workers).max(1),
+    };
+
     let mut verify_time = options.verify_numeric.then_some(Duration::ZERO);
     let mut check_iters = Vec::with_capacity(options.iterations.get());
+    let mut wall_iters = Vec::with_capacity(options.iterations.get());
     let mut element_checks = Vec::with_capacity(checked.len());
     let mut first_verdicts: Vec<bool> = Vec::with_capacity(checked.len());
     for iteration in 1..=options.iterations.get() {
-        let mut session = EquivSession::with_recycle_terms(
-            &reference.arena,
-            &optimized.arena,
-            options.recycle_terms,
+        let role = if iteration == 1 {
+            IterationRole::First {
+                verify_numeric: options.verify_numeric,
+            }
+        } else {
+            IterationRole::Later {
+                iteration,
+                first_verdicts: &first_verdicts,
+            }
+        };
+        let wall_start = Instant::now();
+        let slots = run_solve_iteration(
+            reference,
+            optimized,
+            &checked,
+            (&counts1, &counts2),
+            worker_recycle,
+            chunk_size,
+            role,
         );
+        wall_iters.push(wall_start.elapsed());
+
         let mut iter_time = Duration::ZERO;
-        for (slot, &(name, index, r, o)) in checked.iter().enumerate() {
-            let check_start = Instant::now();
-            let equivalent = session.check(r, o)?;
-            let check = check_start.elapsed();
+        for (slot, outcome) in slots.into_iter().enumerate() {
+            // A worker stops its chunk at its first error, so in slot
+            // order every error precedes its chunk's unfilled slots -
+            // reaching an empty slot here is impossible, and `?` on the
+            // first error yields the lowest-slot error deterministically.
+            let outcome = outcome.expect("worker fills every slot up to its first error");
+            let SlotOutcome {
+                equivalent,
+                check,
+                verify,
+            } = outcome?;
             iter_time += check;
             if iteration == 1 {
+                let (name, index, ..) = checked[slot];
                 element_checks.push(ElementCheckTime {
                     array: name.to_string(),
                     index,
                     check,
                 });
-                if let Some(verify_time) = verify_time.as_mut() {
-                    let verify_start = Instant::now();
-                    numeric::verify_verdict(&reference.arena, r, &optimized.arena, o, equivalent)
-                        .map_err(|message| EquivCheckError::Numeric {
-                        message: format!("array '{}' element {}: {}", name, index, message),
-                    })?;
-                    *verify_time += verify_start.elapsed();
+                if let (Some(total), Some(verify)) = (verify_time.as_mut(), verify) {
+                    *total += verify;
                 }
                 first_verdicts.push(equivalent);
-            } else {
-                check_iteration_agreement(
-                    first_verdicts[slot],
-                    equivalent,
-                    name,
-                    index,
-                    iteration,
-                )?;
             }
         }
         check_iters.push(iter_time);
@@ -442,6 +622,7 @@ pub fn check_output_equivalence_with(
         elements_total,
         check_iters,
         element_checks,
+        wall_iters,
         pair_time,
         verify_time,
     })
@@ -886,6 +1067,7 @@ mod tests {
             check_output_equivalence_with(&reference, &optimized, &names(&["out"]), &options)
                 .unwrap();
         assert_eq!(report.check_iters.len(), 3);
+        assert_eq!(report.wall_iters.len(), 3);
         assert_eq!(report.check_time(), report.check_iters[0]);
         assert_eq!(report.elements_checked, 3);
         assert_eq!(report.elements_total, 3);
@@ -945,20 +1127,161 @@ mod tests {
 
     /// With `verify_numeric` on, the oracle's time is reported in its own
     /// bucket (`Some` exactly when the flag is set), never folded into the
-    /// solve iterations.
+    /// solve iterations - including when the oracle runs inside parallel
+    /// workers.
     #[test]
     fn verify_numeric_time_is_reported_separately() {
         let reference = output_with(&[("out", &[0, 1])]);
         let optimized = output_with(&[("out", &[0, 1])]);
-        let options = EquivCheckOptions {
-            verify_numeric: true,
-            ..EquivCheckOptions::default()
+        for parallelism in [1, 2] {
+            let options = EquivCheckOptions {
+                verify_numeric: true,
+                parallelism: NonZeroUsize::new(parallelism).unwrap(),
+                ..EquivCheckOptions::default()
+            };
+            let report =
+                check_output_equivalence_with(&reference, &optimized, &names(&["out"]), &options)
+                    .unwrap();
+            assert!(matches!(report.outcome, EquivOutcome::Equivalent));
+            assert!(report.verify_time.is_some());
+        }
+    }
+
+    /// Parallel solving is a pure partition of the element list: any
+    /// worker count (more chunks than elements included) and even
+    /// per-element session recycling produce the serial run's verdicts,
+    /// mismatch list, element order, and timing-shape invariants.
+    #[test]
+    fn parallel_solve_matches_serial() {
+        let arrays: &[(&str, &[u64])] = &[("out", &[0, 1, 2, 3, 4, 5]), ("aux", &[0, 1, 2])];
+        let bad: &[(&str, u64)] = &[("out", 2), ("out", 5), ("aux", 1)];
+        let reference = output_with(arrays);
+        let mut arena = ExprArena::new();
+        let wrong = arena.intern_string("wrong");
+        let outputs = arrays
+            .iter()
+            .map(|(name, indices)| {
+                let good = arena.intern_string(*name);
+                let elems = indices
+                    .iter()
+                    .map(|&i| {
+                        let sid = if bad.contains(&(*name, i)) { wrong } else { good };
+                        (i, arena.input_element(sid, i))
+                    })
+                    .collect();
+                (name.to_string(), elems)
+            })
+            .collect();
+        let optimized = AnalysisOutput {
+            arena,
+            outputs,
+            stats: Stats::default(),
+            op_counts: std::collections::BTreeMap::new(),
         };
-        let report =
-            check_output_equivalence_with(&reference, &optimized, &names(&["out"]), &options)
-                .unwrap();
-        assert!(matches!(report.outcome, EquivOutcome::Equivalent));
-        assert!(report.verify_time.is_some());
+
+        let order: Vec<(&str, u64)> = arrays
+            .iter()
+            .flat_map(|(name, indices)| indices.iter().map(|&i| (*name, i)))
+            .collect();
+        for (parallelism, recycle_terms) in [
+            (1, DEFAULT_RECYCLE_TERMS),
+            (3, DEFAULT_RECYCLE_TERMS),
+            // More workers than elements: capped at one element per chunk.
+            (64, DEFAULT_RECYCLE_TERMS),
+            // Tiny aggregate cap: per-worker recycling on nearly every
+            // element must not change verdicts.
+            (2, 1),
+        ] {
+            let options = EquivCheckOptions {
+                iterations: NonZeroUsize::new(2).unwrap(),
+                parallelism: NonZeroUsize::new(parallelism).unwrap(),
+                recycle_terms,
+                ..EquivCheckOptions::default()
+            };
+            let report = check_output_equivalence_with(
+                &reference,
+                &optimized,
+                &names(&["out", "aux"]),
+                &options,
+            )
+            .unwrap();
+            assert_eq!(report.elements_checked, 9);
+            assert_eq!(report.check_iters.len(), 2);
+            assert_eq!(report.wall_iters.len(), 2);
+            // Element results stay in `sampled_elements` order no matter
+            // how the list was partitioned, and still sum to iteration 1.
+            assert_eq!(
+                report
+                    .element_checks
+                    .iter()
+                    .map(|e| (e.array.as_str(), e.index))
+                    .collect::<Vec<_>>(),
+                order,
+                "parallelism {}",
+                parallelism
+            );
+            assert_eq!(
+                report
+                    .element_checks
+                    .iter()
+                    .map(|e| e.check)
+                    .sum::<Duration>(),
+                report.check_iters[0]
+            );
+            let EquivOutcome::NotEquivalent { mismatches } = report.outcome else {
+                panic!("parallelism {}: expected the planted mismatches", parallelism);
+            };
+            assert_eq!(
+                mismatches
+                    .iter()
+                    .map(|m| (m.array.as_str(), m.index))
+                    .collect::<Vec<_>>(),
+                bad,
+                "parallelism {}",
+                parallelism
+            );
+        }
+    }
+
+    /// An element error (here an `Undefined` reaching the decision
+    /// procedure) surfaces from a parallel run exactly as from the serial
+    /// loop, whichever chunk it lands in.
+    #[test]
+    fn parallel_solve_surfaces_element_errors() {
+        let reference = output_with(&[("out", &[0, 1, 2, 3, 4])]);
+        let mut arena = ExprArena::new();
+        let sid = arena.intern_string("out");
+        let elems = (0..5)
+            .map(|i| {
+                let e = if i == 3 {
+                    arena.undefined()
+                } else {
+                    arena.input_element(sid, i)
+                };
+                (i, e)
+            })
+            .collect();
+        let broken = AnalysisOutput {
+            arena,
+            outputs: vec![("out".to_string(), elems)],
+            stats: Stats::default(),
+            op_counts: std::collections::BTreeMap::new(),
+        };
+        for parallelism in [1, 4] {
+            let options = EquivCheckOptions {
+                parallelism: NonZeroUsize::new(parallelism).unwrap(),
+                ..EquivCheckOptions::default()
+            };
+            let err =
+                check_output_equivalence_with(&reference, &broken, &names(&["out"]), &options)
+                    .unwrap_err();
+            assert!(
+                matches!(err, EquivCheckError::Equiv(_)),
+                "parallelism {}: {}",
+                parallelism,
+                err
+            );
+        }
     }
 
     /// `sampled_elements` is the one definition of which elements get

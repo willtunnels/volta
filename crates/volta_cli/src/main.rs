@@ -213,6 +213,14 @@ struct CompareArgs {
     #[arg(long, default_value_t = NonZeroUsize::MIN)]
     iterations: NonZeroUsize,
 
+    /// Solve the VC elements on N worker threads (contiguous element
+    /// chunks, one private session per worker; --recycle-terms stays the
+    /// aggregate memory cap). Verdicts are unaffected; above 1 the
+    /// reported decision-procedure time is summed across workers and
+    /// exceeds wall clock. Decision backend only.
+    #[arg(long, default_value_t = NonZeroUsize::MIN)]
+    parallel: NonZeroUsize,
+
     /// Skip the per-instruction-kind execution profile (shown by default)
     #[arg(long = "no-profile", action = clap::ArgAction::SetFalse, default_value_t = true)]
     profile: bool,
@@ -534,6 +542,9 @@ fn cmd_compare(args: CompareArgs, log: &mut run_log::RunLog) -> ExitCode {
     if args.iterations.get() > 1 && matches!(args.backend, BackendArg::Z3) {
         eprintln!("note: --iterations only affects --backend decision");
     }
+    if args.parallel.get() > 1 && matches!(args.backend, BackendArg::Z3) {
+        eprintln!("note: --parallel only affects --backend decision");
+    }
 
     let (reference, optimized, exec_secs): (AnalysisOutput, AnalysisOutput, Option<f64>) =
         if let Some(dump_path) = &args.from_dump {
@@ -672,6 +683,7 @@ fn cmd_compare(args: CompareArgs, log: &mut run_log::RunLog) -> ExitCode {
                 verify_numeric: args.verify_numeric,
                 recycle_terms: args.recycle_terms,
                 iterations: args.iterations,
+                parallelism: args.parallel,
             };
             let vc_start = Instant::now();
             let report =
@@ -696,6 +708,14 @@ fn cmd_compare(args: CompareArgs, log: &mut run_log::RunLog) -> ExitCode {
                         report.check_time().as_secs_f64(),
                         elems
                     );
+                    if args.parallel.get() > 1 {
+                        println!(
+                            "  ({} workers; decision-procedure time is summed across \
+                             workers, wall clock {:.3}s)",
+                            args.parallel,
+                            report.wall_iters[0].as_secs_f64()
+                        );
+                    }
                     if report.check_iters.len() > 1 {
                         let per_iter: Vec<String> = report
                             .check_iters

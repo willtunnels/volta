@@ -78,8 +78,17 @@ pub struct BenchmarkStats {
     /// (`EquivCheckReport::check_iters`) - excludes VC pairing and the
     /// optional `--verify-numeric` oracle, so the solve columns report
     /// the same quantity whether or not verification aids are switched
-    /// on. Empty for race-check benchmarks and failures.
+    /// on. Under `--parallel` N > 1 the summed spans run concurrently
+    /// (they include cross-worker contention and exceed wall clock -
+    /// see `solve_wall_iters_secs`). Empty for race-check benchmarks
+    /// and failures.
     pub solve_iters_secs: Vec<f64>,
+    /// Wall-clock time of each decision-solve iteration's element pass
+    /// (`EquivCheckReport::wall_iters`). Tracks `solve_iters_secs` at
+    /// `--parallel` 1; under parallelism it is the honest elapsed
+    /// number while `solve_iters_secs` stays the summed
+    /// backend-comparable measure. Empty when no solve ran.
+    pub solve_wall_iters_secs: Vec<f64>,
     /// Time in the `--verify-numeric` f64-oracle confirmations (they run
     /// on solve iteration 1 only); `Some` exactly when the flag was on.
     /// Excluded from `solve_iters_secs` - see
@@ -248,6 +257,11 @@ pub struct RunnerConfig {
     /// How many times each timed phase runs (VC generation, decision
     /// solve, and the Z3 solve when enabled); tables report medians.
     pub iterations: NonZeroUsize,
+    /// Worker threads for the decision solve's element loop
+    /// (`EquivCheckOptions::parallelism`; `--recycle-terms` stays the
+    /// aggregate cap across workers). Keep 1 for paper-comparable
+    /// timings.
+    pub parallelism: NonZeroUsize,
     /// Write each equivalence benchmark's VC dump under this directory
     /// (`None` = don't persist VCs).
     pub vcs_dir: Option<PathBuf>,
@@ -264,6 +278,7 @@ impl Default for RunnerConfig {
             verify_numeric: false,
             recycle_terms: volta_analysis::equiv::DEFAULT_RECYCLE_TERMS,
             iterations: NonZeroUsize::MIN,
+            parallelism: NonZeroUsize::MIN,
             vcs_dir: None,
             z3: None,
         }
@@ -1073,12 +1088,14 @@ impl BenchmarkRunner {
             verify_numeric: self.config.verify_numeric,
             recycle_terms: self.config.recycle_terms,
             iterations: self.config.iterations,
+            parallelism: self.config.parallelism,
         };
         let report = check_output_equivalence_with(reference, optimized, arrays, &options)
             .context("checking output equivalence")?;
         stats.elements_checked = report.elements_checked;
         stats.elements_total = report.elements_total;
         stats.solve_iters_secs = report.check_iters.iter().map(|d| d.as_secs_f64()).collect();
+        stats.solve_wall_iters_secs = report.wall_iters.iter().map(|d| d.as_secs_f64()).collect();
         stats.verify_numeric_secs = report.verify_time.map(|d| d.as_secs_f64());
         stats.decision_elements = report.element_checks;
         Ok(match report.outcome {

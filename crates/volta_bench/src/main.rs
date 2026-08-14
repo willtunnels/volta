@@ -97,6 +97,15 @@ struct Cli {
     #[arg(long, global = true, default_value_t = NonZeroUsize::new(10).unwrap())]
     iterations: NonZeroUsize,
 
+    /// Solve each benchmark's VC elements on this many worker threads
+    /// (decision solve only; contiguous element chunks, one private
+    /// session per worker; --recycle-terms stays the aggregate memory
+    /// cap). Verdicts are unaffected; above 1 the summed solve timings
+    /// include cross-worker contention (the records add solve_wall_*),
+    /// so keep 1 for paper-comparable measurements
+    #[arg(long, global = true, default_value_t = NonZeroUsize::MIN)]
+    parallel: NonZeroUsize,
+
     /// Also solve every equivalence benchmark's VCs with Z3 (SMT-LIB2
     /// evaluated via libz3 in a killable worker subprocess) for a
     /// side-by-side comparison; exp-containing benchmarks get a second
@@ -369,6 +378,7 @@ fn main() -> ExitCode {
         sample: cli.sample,
         verify_numeric: cli.verify_numeric,
         recycle_terms: cli.recycle_terms,
+        parallelism: cli.parallel.get(),
         z3_timeout_secs,
         solve_backend: None,
     };
@@ -382,6 +392,7 @@ fn main() -> ExitCode {
         verify_numeric: cli.verify_numeric,
         recycle_terms: cli.recycle_terms,
         iterations: cli.iterations,
+        parallelism: cli.parallel,
         vcs_dir: Some(cli.out_dir.join("vcs")),
         z3: cli.z3.then(|| Z3Options {
             timeout: volta_z3::timeout_from_secs(cli.z3_timeout),
@@ -536,6 +547,9 @@ fn main() -> ExitCode {
             if cli.recycle_terms != volta_analysis::equiv::DEFAULT_RECYCLE_TERMS {
                 ignored.push("--recycle-terms");
             }
+            if cli.parallel.get() != 1 {
+                ignored.push("--parallel");
+            }
             if cli.z3_timeout != DEFAULT_Z3_TIMEOUT_SECS {
                 ignored.push("--z3-timeout");
             }
@@ -607,6 +621,12 @@ fn main() -> ExitCode {
                 eprintln!(
                     "note: --recycle-terms tunes the decision procedure's intern \
                      tables; it has no effect with --backend z3"
+                );
+            }
+            if cli.parallel.get() != 1 && !backend.runs_decision() {
+                eprintln!(
+                    "note: --parallel parallelizes the decision solve's element \
+                     loop; it has no effect with --backend z3"
                 );
             }
             if cli.z3_timeout != DEFAULT_Z3_TIMEOUT_SECS && !backend.runs_z3() {

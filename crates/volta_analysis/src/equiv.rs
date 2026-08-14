@@ -6,7 +6,9 @@
 //! make shared structure (score polynomials, softmax denominators, the
 //! other 63 columns of the row) free after the first element.
 
-use crate::canon::{CanonError, Session};
+use std::sync::Arc;
+
+use crate::canon::{CanonError, Session, Side, parent_counts};
 use crate::logging::info;
 use crate::symbolic::{ExprArena, ExprId};
 
@@ -51,6 +53,12 @@ pub struct EquivSession<'a> {
     recycle_terms: usize,
     arena1: &'a ExprArena,
     arena2: &'a ExprArena,
+    /// Parent counts for the two arenas (see `canon::parent_counts`) -
+    /// held here so recycling reuses them instead of rescanning the
+    /// (possibly GiB-scale) arenas, and so parallel callers can hand
+    /// every worker session the same computation.
+    counts1: Arc<Vec<u32>>,
+    counts2: Arc<Vec<u32>>,
 }
 
 /// Default recycle bound. Bytes per term are workload-dependent: polynomial
@@ -72,11 +80,36 @@ impl<'a> EquivSession<'a> {
         arena2: &'a ExprArena,
         recycle_terms: usize,
     ) -> Self {
+        Self::with_shared_counts(
+            arena1,
+            arena2,
+            recycle_terms,
+            Arc::new(parent_counts(arena1)),
+            Arc::new(parent_counts(arena2)),
+        )
+    }
+
+    /// Like [`with_recycle_terms`](Self::with_recycle_terms), but with the
+    /// arenas' parent counts (`canon::parent_counts`, in the same arena
+    /// order) precomputed by the caller - for building many sessions over
+    /// the same arena pair (e.g. one per parallel worker) without each
+    /// rescanning the arenas or duplicating the count vectors.
+    pub fn with_shared_counts(
+        arena1: &'a ExprArena,
+        arena2: &'a ExprArena,
+        recycle_terms: usize,
+        counts1: Arc<Vec<u32>>,
+        counts2: Arc<Vec<u32>>,
+    ) -> Self {
+        assert_eq!(counts1.len(), arena1.node_count(), "counts1/arena1 mismatch");
+        assert_eq!(counts2.len(), arena2.node_count(), "counts2/arena2 mismatch");
         Self {
-            session: Session::new(),
+            session: fresh_session(&counts1, &counts2),
             recycle_terms,
             arena1,
             arena2,
+            counts1,
+            counts2,
         }
     }
 
@@ -88,12 +121,22 @@ impl<'a> EquivSession<'a> {
                 "recycling VC session at {} interned terms",
                 self.session.interned_terms()
             );
-            self.session = Session::new();
+            self.session = fresh_session(&self.counts1, &self.counts2);
         }
         Ok(self
             .session
             .check_equivalent(self.arena1, e1, self.arena2, e2)?)
     }
+}
+
+/// A new canon session with the pair's parent counts installed - the one
+/// session constructor for both `EquivSession::with_shared_counts` and
+/// every recycle, so recycling never rescans the arenas.
+fn fresh_session(counts1: &Arc<Vec<u32>>, counts2: &Arc<Vec<u32>>) -> Session {
+    let mut session = Session::new();
+    session.provide_ref_counts(Side::Reference, Arc::clone(counts1));
+    session.provide_ref_counts(Side::Optimized, Arc::clone(counts2));
+    session
 }
 
 /// One-shot equivalence check (a fresh session per call; prefer
@@ -238,6 +281,46 @@ mod tests {
         let a = arena.param_symbol("a");
         let u = arena.undefined();
         assert!(check_equivalent(&arena, a, &arena, u).is_err());
+    }
+
+    /// `with_shared_counts` (caller-precomputed parent counts, as the
+    /// parallel driver builds per-worker sessions) decides exactly like
+    /// the count-computing constructor, including across recycles
+    /// (`recycle_terms = 1` forces a recycle before nearly every check,
+    /// exercising the counts-preserving `fresh_session` path).
+    #[test]
+    fn shared_counts_sessions_match_default_sessions() {
+        let mut arena = ExprArena::new();
+        let sid = arena.intern_string("a");
+        let tid = arena.intern_string("b");
+        let cases: Vec<(ExprId, ExprId, bool)> = (0..4)
+            .map(|i| {
+                let a = arena.input_element(sid, i);
+                let b = arena.input_element(tid, i);
+                let ab = arena.add(a, b);
+                let ba = arena.add(b, a);
+                let bb = arena.add(b, b);
+                if i % 2 == 0 {
+                    (ab, ba, true)
+                } else {
+                    (ab, bb, false)
+                }
+            })
+            .collect();
+
+        let counts = Arc::new(parent_counts(&arena));
+        let mut shared = EquivSession::with_shared_counts(
+            &arena,
+            &arena,
+            1,
+            Arc::clone(&counts),
+            Arc::clone(&counts),
+        );
+        let mut default = EquivSession::with_recycle_terms(&arena, &arena, 1);
+        for &(a, b, want) in &cases {
+            assert_eq!(shared.check(a, b).unwrap(), want);
+            assert_eq!(default.check(a, b).unwrap(), want);
+        }
     }
 
     /// Regression: a named symbol whose string spells a machine symbol's

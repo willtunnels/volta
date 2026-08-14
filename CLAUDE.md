@@ -169,21 +169,32 @@ nvcc's `selp` accumulator-init idiom both rely on this.
   definition of *which* elements get checked, used by both backends and
   the bench harness's Z3 re-solve loop
 - `check_output_equivalence_with(ref, opt, arrays, options)` - the per-element
-  check, one shared `EquivSession` per solve iteration.
+  check, one `EquivSession` per worker per solve iteration (one shared
+  session at the default `parallelism` 1).
   `EquivCheckOptions`: `sample`, `verify_numeric` (f64 oracle per
   element; iteration 1 only), `recycle_terms`, `iterations`
   (`NonZeroUsize`, default 1: re-solve the same sampled elements N
   times, fresh session each - cold-start timings, memory bounded since
   each session drops before the next; the verdict comes from iteration 1
   and later iterations must agree, else `IterationDisagreement` - a
-  free determinism check). Returns a report with the outcome,
-  checked/total element counts, `check_iters: Vec<Duration>` (each
-  iteration's summed `EquivSession::check` durations only - pairing and
-  the oracle excluded; `check_time()` = iteration 1's), `element_checks:
+  free determinism check), `parallelism` (`NonZeroUsize`, default 1:
+  split the element list into contiguous chunks, one worker thread with
+  a private session per chunk - verdicts are session-independent (the
+  property the iterations check rests on) so the partition can't change
+  them, contiguity keeps row-local shared structure in one session, and
+  `recycle_terms` stays the *aggregate* cap (each worker recycles at
+  cap/workers); the summed timings then include cross-worker contention,
+  so keep 1 for paper-comparable numbers). Returns a report with the
+  outcome, checked/total element counts, `check_iters: Vec<Duration>`
+  (each iteration's summed `EquivSession::check` durations only -
+  pairing and the oracle excluded; `check_time()` = iteration 1's),
+  `element_checks:
   Vec<ElementCheckTime>` (iteration 1's per-element check durations in
   `sampled_elements` order - the same measurements `check_iters[0]`
   sums, recorded outside the timed spans, so carrying them is free; the
-  bench harness's `decision_elements`), `pair_time`
+  bench harness's `decision_elements`), `wall_iters` (each iteration's
+  elapsed element pass - tracks `check_iters` at parallelism 1, the
+  honest elapsed number above it), `pair_time`
   (the `paired_elements` call), and `verify_time` (the oracle's total
   time, `Some` iff `verify_numeric`).
 - `check_output_equivalence(ref, opt, arrays)` - the Default-options wrapper
@@ -227,7 +238,12 @@ The paper's canonicalizer, in Rust:
 - `equiv.rs` - thin wrapper: `EquivSession` (reuse across elements;
   recycles its intern tables past a configurable term bound -
   `with_recycle_terms`, default `DEFAULT_RECYCLE_TERMS` = 4M) and one-shot
-  `check_equivalent`. Memory scale: exp-heavy attention terms run 2-4 KB
+  `check_equivalent`. The interning policy's sharing test (per-side
+  parent counts, `canon::parent_counts`) is plain arena-derived data:
+  sessions take it precomputed (`with_shared_counts` /
+  `Session::provide_ref_counts`), so recycles and the driver's parallel
+  workers share one scan instead of each re-walking GiB-scale arenas.
+  Memory scale: exp-heavy attention terms run 2-4 KB
   each, so one warm FlashAttention output row retains several GiB; small
   bounds trade re-canonicalization time for bounded memory.
 - `numeric.rs` - the f64 oracle: seeded random inputs, memoized DAG eval;
@@ -326,7 +342,7 @@ Benchmark definitions with full launch/param configs live in
 `src/benchmarks/*.rs`. Run with `cargo run --release -p volta_bench --
 category <reduction|matmul|attention|causal|conv|agent|tilelang|race>
 [--sample N] [--verify-numeric] [--recycle-terms N] [--iterations N]
-[--z3] [--z3-timeout N] [--out-dir DIR]` (also `all`, `single <name>`,
+[--parallel N] [--z3] [--z3-timeout N] [--out-dir DIR]` (also `all`, `single <name>`,
 `list`, and the phase-decoupled `generate`/`solve` below; release mode
 matters: ~20x, and the binary prints loud stderr
 warnings at startup for a debug build or, under the `logging` feature,
@@ -345,8 +361,11 @@ kind only, since diagnostic text may embed schedule-dependent details -
 verdict kinds are the contract; a mismatch fails the benchmark loudly), then
 the dump written once from the last generation (timed as
 `dump_write_secs`), then **decision solve** (`--iterations` runs via
-`driver::check_output_equivalence_with` - fresh session per iteration,
-verdict from iteration 1, later iterations must agree), then the
+`driver::check_output_equivalence_with` - fresh session(s) per iteration,
+verdict from iteration 1, later iterations must agree; `--parallel N`
+solves each iteration's element list on N worker threads - verdicts
+unchanged, summed solve timings then include contention, so keep 1 for
+paper-comparable numbers), then the
 optional **Z3 solve** (`--z3`; `src/z3_phase.rs`) over the exact same
 `driver::sampled_elements` list. Race-check benchmarks stop after
 generation (no dump/solve/Z3). Every timed phase defaults to
@@ -403,8 +422,9 @@ passing = the phase completed *and* z3 refuted nothing - a
 DIFF`, since nothing else rules it and even a spurious refutation -
 volta_z3's division-at-zero divergence - must surface;
 unknown/timeout/unsupported stay non-failing data). `--sample` applies
-to `solve`; `--verify-numeric`/`--recycle-terms` act on its decision
-phase and `--z3-timeout` on its z3 phase (each noted-and-ignored under a
+to `solve`; `--verify-numeric`/`--recycle-terms`/`--parallel` act on its
+decision phase and `--z3-timeout` on its z3 phase (each
+noted-and-ignored under a
 backend without that phase, and by `generate`); `--z3` is one-shot-only
 and both new subcommands reject it. Records split accordingly:
 `generate` records carry gen fields only, `solve` records carry solve
@@ -422,9 +442,13 @@ sanitization is rejected up front naming both offenders -
 benchmarks are skipped with a console note) and
 `results/<unix-seconds>-<pid>-<command>.json` for every run command,
 one schema (built in `src/results.rs`): header
-(argv/timestamp/iterations/sample/recycle-terms/`z3` flag + timeout +
+(argv/timestamp/iterations/sample/recycle-terms/parallelism/`z3` flag +
+timeout +
 the carve-out convention) and per-benchmark records - status/detail/
-passed, element counts, per-phase stats (`vc_gen_*` and `solve_*`: full
+passed, element counts, per-phase stats (`vc_gen_*`, `solve_*`, and
+`solve_wall_*` - the solve iterations' wall clock, which tracks
+`solve_*` at `--parallel` 1 and is the honest elapsed number above it:
+full
 `*_iters_secs` array + median/min/mean/cv), `dump_write_secs`,
 `verify_numeric_secs` (oracle time, `Some` iff the flag),
 `decision_elements` (iteration 1's per-element decision times, from
@@ -457,8 +481,10 @@ Commands:
   `--check-array NAME` (repeatable, required) names the output arrays to
   check - the explicit `paired_elements` list, checked against the
   declared config before execution and by `paired_elements` after.
-  `--backend decision|z3`, `--iterations N` (decision backend only,
-  default 1), `--dump-vcs`/
+  `--backend decision|z3`, `--iterations N` and `--parallel N` (both
+  decision backend only, default 1; `--parallel` solves the element list
+  on N worker threads - same verdicts, and the console then reports
+  summed-across-workers decision time beside wall clock), `--dump-vcs`/
   `--from-dump` (the shared `driver::vc_dump` format - volta-bench's
   `bench-out/vcs/*.vcdump` files replay here too). Exits 0 only when every
   checked element is proved equivalent.

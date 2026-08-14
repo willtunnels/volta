@@ -18,6 +18,23 @@ use super::coeff::Coeff;
 use super::ops::{PV, RatV};
 use super::{CanonError, Session, Side};
 
+/// Count each node's parents over the whole arena (a conservative
+/// overapproximation of sharing among the nodes canonicalization will
+/// visit). Depends only on the arena, so callers checking many elements
+/// (or checking on several worker threads) can compute this once and
+/// hand every session the same counts via
+/// [`Session::provide_ref_counts`].
+pub fn parent_counts(arena: &ExprArena) -> Vec<u32> {
+    let n = arena.node_count();
+    let mut counts = vec![0u32; n];
+    for i in 0..n {
+        arena.node(ExprId(i as u32)).for_each_child(|child| {
+            counts[child.0 as usize] = counts[child.0 as usize].saturating_add(1);
+        });
+    }
+    counts
+}
+
 impl Session {
     /// Canonicalize `e` (from the `side` kernel's arena) into an interned
     /// rational. Roots are always interned and memoized.
@@ -37,21 +54,14 @@ impl Session {
         Ok(rat)
     }
 
-    /// Count each node's parents over the whole arena (a conservative
-    /// overapproximation of sharing among the nodes we will visit).
+    /// Fill the side's parent counts if they aren't already provided
+    /// (via [`Session::provide_ref_counts`]) or computed.
     fn ensure_ref_counts(&mut self, side: Side, arena: &ExprArena) {
-        let n = arena.node_count();
         let counts = self.ref_counts.entry(side).or_default();
-        if counts.len() >= n {
+        if counts.len() >= arena.node_count() {
             return;
         }
-        let mut fresh = vec![0u32; n];
-        for i in 0..n {
-            arena.node(ExprId(i as u32)).for_each_child(|child| {
-                fresh[child.0 as usize] = fresh[child.0 as usize].saturating_add(1);
-            });
-        }
-        *counts = fresh;
+        *counts = std::sync::Arc::new(parent_counts(arena));
     }
 
     fn is_shared(&self, side: Side, e: ExprId) -> bool {

@@ -134,6 +134,11 @@ pub struct RunMeta {
     pub sample: u64,
     pub verify_numeric: bool,
     pub recycle_terms: usize,
+    /// Decision-solve worker threads (`--parallel`). Above 1 the
+    /// benchmarks' `solve_iters_secs` sums include cross-worker
+    /// contention (see `solve_wall_iters_secs`), so a results reader
+    /// needs this to interpret the solve columns.
+    pub parallelism: usize,
     /// `Some(per-query timeout)` exactly when the Z3 phase is enabled.
     pub z3_timeout_secs: Option<u64>,
     /// `Some(backend name)` exactly for `solve` runs, whose VCs come
@@ -260,6 +265,9 @@ fn insert_gen_fields(obj: &mut serde_json::Map<String, Value>, r: &BenchmarkResu
 fn insert_solve_fields(obj: &mut serde_json::Map<String, Value>, r: &BenchmarkResult) {
     obj.insert("elements_checked".into(), json!(r.stats.elements_checked));
     insert_phase_stats(obj, "solve", &r.stats.solve_iters_secs);
+    // Wall clock of the same iterations: tracks the summed stats above at
+    // --parallel 1, diverges under parallelism (the header records it).
+    insert_phase_stats(obj, "solve_wall", &r.stats.solve_wall_iters_secs);
     // The `--verify-numeric` oracle's time (iteration 1 only); null when
     // the flag was off. Kept out of the solve stats so those don't move
     // when the oracle is toggled.
@@ -352,6 +360,7 @@ pub fn results_doc(meta: &RunMeta, benchmarks: Vec<Value>) -> Value {
     doc.insert("sample".into(), json!(meta.sample));
     doc.insert("verify_numeric".into(), json!(meta.verify_numeric));
     doc.insert("recycle_terms".into(), json!(meta.recycle_terms));
+    doc.insert("parallelism".into(), json!(meta.parallelism));
     if let Some(backend) = meta.solve_backend {
         // A `solve` run: which backend(s) solved, and that the VCs were
         // loaded from `generate`'s dumps rather than freshly generated.
@@ -590,6 +599,7 @@ mod tests {
             sample: 1,
             verify_numeric: false,
             recycle_terms: 0,
+            parallelism: 1,
             z3_timeout_secs: None,
             solve_backend: Some("decision"),
         };

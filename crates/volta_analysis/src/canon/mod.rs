@@ -13,10 +13,12 @@ mod coeff;
 mod ops;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::symbolic::{ExprArena, ExprId};
 
 pub use arena::{CanonArena, Rat};
+pub use canonicalize::parent_counts;
 pub use coeff::{Coeff, CoeffError};
 
 use arena::TermId;
@@ -83,8 +85,11 @@ pub struct Session {
     pub(crate) arena: CanonArena,
     pub(crate) expr_memo: HashMap<(Side, ExprId), Rat>,
     pub(crate) term_mul_memo: HashMap<(TermId, TermId), TermId>,
-    /// Per side: how many parents each `ExprId` has (over the whole arena)
-    pub(crate) ref_counts: HashMap<Side, Vec<u32>>,
+    /// Per side: how many parents each `ExprId` has (over the whole
+    /// arena). `Arc` so callers that build many sessions over the same
+    /// arenas (recycling, parallel workers) can share one computation
+    /// via [`Session::provide_ref_counts`]; computed lazily otherwise.
+    pub(crate) ref_counts: HashMap<Side, Arc<Vec<u32>>>,
     pub(crate) ops: u64,
     pub(crate) budget: u64,
 }
@@ -108,6 +113,16 @@ impl Session {
     /// Term operations performed so far (diagnostics).
     pub fn ops_used(&self) -> u64 {
         self.ops
+    }
+
+    /// Install precomputed parent counts for one side's arena - the
+    /// result of [`parent_counts`] over that exact arena. Counts affect
+    /// only which intermediate results are interned (memory/time), never
+    /// verdicts, but mismatched counts forfeit the sharing discipline -
+    /// so the length is checked against the arena at first use
+    /// (`ensure_ref_counts` recomputes if the counts are too short).
+    pub fn provide_ref_counts(&mut self, side: Side, counts: Arc<Vec<u32>>) {
+        self.ref_counts.insert(side, counts);
     }
 
     /// Number of interned terms - the dominant memory consumer. Callers
