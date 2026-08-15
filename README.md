@@ -1,7 +1,5 @@
 # Volta
 
-> ⚠️ This is not the code that was used for the paper. That code was written by Kshitij Dubey at MSR and they have not agreed to released it. Hopefully, this reconstruction is useful; it appears to work on all the benchmarks from the paper. I've been quite busy, so some parts were written almost entirely by Fable 5 and I did not have time to do extensive quality assurance. ⚠️
-
 Volta is a data race and equivalence checker for NVIDIA GPU kernels, implementing the approach from ["Equivalence Checking of ML GPU Kernels"](https://arxiv.org/pdf/2511.12638). Given a reference kernel implementation and an optimized counterpart, Volta proves their semantic equivalence over the reals, i.e., that they produce identical outputs for all valid inputs modulo floating point error, thereby verifying the correctness of the optimized kernel.
 
 ## Features
@@ -560,4 +558,4 @@ exchange for slower VC checking. The other categories are far lighter
 
 ## License
 
-This repository is licensed under [LICENSE](LICENSE). This implementation of Volta is completely independent from the Python implementation mentioned in the evaluation section of the arxiv paper, which was written by Kshitij Dubey and is owned by Microsoft Research. While I was a co-author of that paper, I never viewed Kshitij's implementation, nor did I discuss any details of it not presented in the arxiv paper.
+This repository is licensed under [LICENSE](LICENSE).
