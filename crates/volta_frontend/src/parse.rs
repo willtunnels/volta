@@ -34,6 +34,7 @@ pub enum ParseErrorKind {
     InvalidType(AsciiString),
     InvalidStateSpace(AsciiString),
     InvalidStateSpaceQualifier(AsciiString),
+    InvalidPtrSpace(AsciiString),
     ExpectedStateSpace(Option<Token>),
     ExpectedType(Option<Token>),
     ExpectedScalarType(Option<Token>),
@@ -70,6 +71,7 @@ impl ParseErrorKind {
             ParseErrorKind::InvalidType(_) => "Invalid Type",
             ParseErrorKind::InvalidStateSpace(_) => "Invalid State Space",
             ParseErrorKind::InvalidStateSpaceQualifier(_) => "Invalid State Space Qualifier",
+            ParseErrorKind::InvalidPtrSpace(_) => "Invalid Pointer Space",
             ParseErrorKind::ExpectedStateSpace(_) => "Expected State Space",
             ParseErrorKind::ExpectedType(_) => "Expected Type",
             ParseErrorKind::ExpectedScalarType(_) => "Expected Scalar Type",
@@ -117,6 +119,10 @@ impl ParseErrorKind {
             ParseErrorKind::InvalidStateSpaceQualifier(name) => {
                 format!("Invalid state space qualifier: .{}", name)
             }
+            ParseErrorKind::InvalidPtrSpace(name) => format!(
+                "Invalid pointer space: .{} (expected one of .const, .global, .local, .shared)",
+                name
+            ),
             ParseErrorKind::ExpectedStateSpace(found) => match found {
                 Some(tok) => format!("Expected state space, found {}", tok),
                 None => "Expected state space, found end of file".to_string(),
@@ -875,6 +881,34 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse the optional kernel-parameter pointer attribute.
+    ///
+    /// According to the PTX ISA (5.1.6.3), attributes are expected to be of the shape:
+    /// `.ptr [.space] [.align N]`
+    fn parse_ptr_attribute(&mut self) -> Result<Option<Ptr>, ParseError> {
+        if !self.try_directive(ascii("ptr"))? {
+            return Ok(None);
+        }
+
+        let space = match self.peek()? {
+            Some((span, Token::DottedIdent(DottedIdent::Simple(s)))) => {
+                if let Some(space) = PtrSpace::from_ascii(s) {
+                    self.next().unwrap();
+                    Some(space)
+                } else if s.as_slice() == ascii("align") {
+                    None
+                } else {
+                    return err_at(span, ParseErrorKind::InvalidPtrSpace(s.clone()));
+                }
+            }
+            _ => None,
+        };
+
+        let align = self.parse_align()?;
+
+        Ok(Some(Ptr { space, align }))
+    }
+
     /// Parse a scalar type like `.f32`, `.s64`, etc.
     fn parse_scalar_type(&mut self) -> Result<ScalarType, ParseError> {
         match self.next()? {
@@ -1055,6 +1089,7 @@ impl<'a> Parser<'a> {
         let (space, _) = self.parse_state_space()?;
         let align = self.parse_align()?;
         let ty = self.parse_type()?;
+        let ptr = self.parse_ptr_attribute()?;
         let (name_span, name) = self.parse_ident_with_span()?;
 
         // Parse array dimensions for byte arrays
@@ -1075,6 +1110,7 @@ impl<'a> Parser<'a> {
             space,
             align,
             ty,
+            ptr,
             name: name.into_inner(),
             array_dims,
         })
@@ -2613,7 +2649,7 @@ mod tests {
 
 .visible .entry add_kernel(
     .param .u64 in_a,
-    .param .u64 in_b,
+    .param .u64 .ptr .global .align 16 in_b,
     .param .u32 n
 )
 {
@@ -2628,6 +2664,16 @@ mod tests {
                 assert_eq!(func.params.len(), 3);
                 assert_eq!(func.params[0].name.as_str(), "in_a");
                 assert_eq!(func.params[0].ty.scalar, ScalarType::U64);
+                assert_eq!(func.params[0].ptr, None);
+                assert_eq!(func.params[1].name.as_str(), "in_b");
+                assert_eq!(func.params[1].ty.scalar, ScalarType::U64);
+                assert_eq!(
+                    func.params[1].ptr,
+                    Some(Ptr {
+                        space: Some(PtrSpace::Global),
+                        align: Some(16),
+                    })
+                );
                 assert_eq!(func.params[2].name.as_str(), "n");
                 assert_eq!(func.params[2].ty.scalar, ScalarType::U32);
             }

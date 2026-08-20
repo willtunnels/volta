@@ -403,6 +403,34 @@ pub struct Type {
     pub scalar: ScalarType,
 }
 
+/// A pointer type attribute
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ptr {
+    pub space: Option<PtrSpace>,
+    pub align: Option<u32>,
+}
+
+/// Possible pointer spaces
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PtrSpace {
+    Const,
+    Global,
+    Local,
+    Shared,
+}
+
+impl FromAscii for PtrSpace {
+    fn from_ascii(s: &[AsciiChar]) -> Option<Self> {
+        Some(match s.as_bytes() {
+            b"const" => PtrSpace::Const,
+            b"global" => PtrSpace::Global,
+            b"local" => PtrSpace::Local,
+            b"shared" => PtrSpace::Shared,
+            _ => return None,
+        })
+    }
+}
+
 // =============================================================================
 // State Spaces
 // =============================================================================
@@ -583,6 +611,8 @@ pub struct Parameter {
     pub space: StateSpace,
     pub align: Option<u32>,
     pub ty: Type,
+    /// Optional pointer attribute for pointer parameters
+    pub ptr: Option<Ptr>,
     pub name: AsciiString,
     /// Array dimensions for byte-array parameters
     pub array_dims: Vec<u32>,
