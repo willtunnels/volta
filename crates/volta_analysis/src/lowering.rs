@@ -346,8 +346,20 @@ impl LoweringContext {
                 })
             }
             AstOperand::Address(addr) => {
-                // Address operand - resolve the base
-                self.resolve_address(addr)
+                // A memory operand `[base + offset]` has no single-operand
+                // value, and resolving just its base would silently drop
+                // the offset (how `ldmatrix ... [%r2+16]` once read `[%r2]`,
+                // issue #4). Memory instructions go through
+                // `resolve_mem_operand`; anything else reaching here is a
+                // lowering bug or malformed PTX.
+                Err(LowerError::UnsupportedInstruction {
+                    instruction: "address operand".to_string(),
+                    reason: Some(format!(
+                        "memory operand {:?} in a value position (memory \
+                         instructions resolve it as base + offset)",
+                        addr
+                    )),
+                })
             }
             AstOperand::Vector(_ops) => {
                 // Vector operand - not handled inline, should be handled by instruction
@@ -529,14 +541,33 @@ impl LoweringContext {
         }
     }
 
-    /// Get offset from address
-    fn get_address_offset(&self, addr: &Address) -> i64 {
+    /// The constant byte offset of an address operand `[base + offset]`
+    /// (0 when absent). PTX address offsets are immediates, so an offset
+    /// that does not evaluate to a constant (an identifier, an operator
+    /// `eval_const_expr` does not model, a division by zero) is rejected
+    /// rather than silently read as `+0`.
+    fn get_address_offset(&self, addr: &Address) -> LowerResult<i64> {
         match &addr.offset {
-            Some(expr) => {
-                // Try to evaluate constant expression
-                Self::eval_const_expr(expr).unwrap_or(0)
+            Some(expr) => Self::eval_const_expr(expr).ok_or_else(|| LowerError::InvalidOperand {
+                instruction: "address operand".to_string(),
+                operand: format!("{:?}", expr),
+                reason: "address offset must be a constant expression",
+            }),
+            None => Ok(0),
+        }
+    }
+
+    /// Resolve a memory operand to `(base, offset)`: `[base + offset]`
+    /// splits into its resolved base and constant byte offset; a bare
+    /// register or immediate is a base with offset 0. Every memory
+    /// instruction resolves its address through here, so no lowering can
+    /// drop the offset (`resolve_operand` rejects address operands).
+    fn resolve_mem_operand(&self, op: &AstOperand) -> LowerResult<(Operand, i64)> {
+        match op {
+            AstOperand::Address(addr) => {
+                Ok((self.resolve_address(addr)?, self.get_address_offset(addr)?))
             }
-            None => 0,
+            _ => Ok((self.resolve_operand(op)?, 0)),
         }
     }
 
@@ -3094,17 +3125,7 @@ fn lower_load(
     }
 
     // Resolve the address operand
-    let (base, offset) = match addr {
-        AstOperand::Address(addr) => {
-            let base = ctx.resolve_address(addr)?;
-            let offset = ctx.get_address_offset(addr);
-            (base, offset)
-        }
-        _ => {
-            let base = ctx.resolve_operand(addr)?;
-            (base, 0)
-        }
-    };
+    let (base, offset) = ctx.resolve_mem_operand(addr)?;
 
     let space = ctx.convert_space(*space, "ld")?;
     let instr_name = format!("ld.{:?}", ty);
@@ -3175,17 +3196,7 @@ fn lower_store(
     }
 
     // Resolve the address operand
-    let (base, offset) = match addr {
-        AstOperand::Address(addr) => {
-            let base = ctx.resolve_address(addr)?;
-            let offset = ctx.get_address_offset(addr);
-            (base, offset)
-        }
-        _ => {
-            let base = ctx.resolve_operand(addr)?;
-            (base, 0)
-        }
-    };
+    let (base, offset) = ctx.resolve_mem_operand(addr)?;
 
     let space = ctx.convert_space(*space, "st")?;
     let instr_name = format!("st.{:?}", ty);
@@ -3232,7 +3243,7 @@ fn param_addr_symbol(ctx: &LoweringContext, addr: &AstOperand) -> LowerResult<(S
     if let AstOperand::Address(addr) = addr
         && let AddressBase::Symbol(name) = &addr.base
     {
-        return Ok((name.to_string(), ctx.get_address_offset(addr)));
+        return Ok((name.to_string(), ctx.get_address_offset(addr)?));
     }
     Err(LowerError::UnsupportedInstruction {
         instruction: "param-space access".to_string(),
@@ -3730,17 +3741,7 @@ fn lower_ld_global_nc(
     check_vec_arity("ld.global.nc", vec, dst_operand)?;
 
     // Resolve address
-    let (base, offset) = match addr_operand {
-        AstOperand::Address(addr) => {
-            let base = ctx.resolve_address(addr)?;
-            let offset = ctx.get_address_offset(addr);
-            (base, offset)
-        }
-        _ => {
-            let base = ctx.resolve_operand(addr_operand)?;
-            (base, 0)
-        }
-    };
+    let (base, offset) = ctx.resolve_mem_operand(addr_operand)?;
 
     // Check if destination is a vector
     match dst_operand {
@@ -3828,12 +3829,13 @@ fn lower_ldmatrix(
     }
 
     let dst = ctx.resolve_dst_vector(&operands[0])?;
-    let addr = ctx.resolve_operand(&operands[1])?;
+    let (base, offset) = ctx.resolve_mem_operand(&operands[1])?;
 
     ctx.emit(
         LoweredInstr::Ldmatrix {
             dst,
-            addr,
+            base,
+            offset,
             num,
             trans,
         },
@@ -4057,7 +4059,7 @@ fn lower_wmma_load(
     }
 
     let dst = ctx.resolve_dst_vector(&operands[0])?;
-    let addr = ctx.resolve_operand(&operands[1])?;
+    let (base, offset) = ctx.resolve_mem_operand(&operands[1])?;
     let stride = ctx.resolve_operand(&operands[2])?;
 
     ctx.emit(
@@ -4066,7 +4068,8 @@ fn lower_wmma_load(
             shape,
             layout,
             dst,
-            addr,
+            base,
+            offset,
             stride,
             elem_type,
             space,
@@ -4151,7 +4154,7 @@ fn lower_wmma_store(
         });
     }
 
-    let addr = ctx.resolve_operand(&operands[0])?;
+    let (base, offset) = ctx.resolve_mem_operand(&operands[0])?;
     let src = ctx.resolve_dst_vector(&operands[1])?;
     let stride = ctx.resolve_operand(&operands[2])?;
 
@@ -4160,7 +4163,8 @@ fn lower_wmma_store(
             shape,
             layout,
             src,
-            addr,
+            base,
+            offset,
             stride,
             elem_type,
             space,
@@ -5030,6 +5034,98 @@ mod tests {
              {%r0, %r1, %r2, %r3, %r4, %r5, %r6, %r7}, \
              {%f0, %f1, %f2, %f3, %f4, %f5, %f6, %f7};",
         );
+    }
+
+    /// Lower `body` and return the byte offset of its one tensor-core
+    /// memory instruction (ldmatrix / wmma.load / wmma.store), whose base
+    /// must have resolved to a register.
+    fn lowered_tensor_offset(body: &str) -> i64 {
+        let prog = lower_body(body)
+            .unwrap_or_else(|e| panic!("expected {:?} to lower, got {:?}", body, e));
+        let mut offsets = prog.instructions.values().filter_map(|instr| match instr {
+            LoweredInstr::Ldmatrix { base, offset, .. }
+            | LoweredInstr::WmmaLoad { base, offset, .. }
+            | LoweredInstr::WmmaStore { base, offset, .. } => {
+                assert!(
+                    matches!(base, Operand::Reg(_)),
+                    "expected a register base in {:?}, got {:?}",
+                    body,
+                    base
+                );
+                Some(*offset)
+            }
+            _ => None,
+        });
+        let offset = offsets
+            .next()
+            .unwrap_or_else(|| panic!("no tensor-core memory instruction lowered from {:?}", body));
+        assert!(
+            offsets.next().is_none(),
+            "expected exactly one tensor-core memory instruction in {:?}",
+            body
+        );
+        offset
+    }
+
+    /// The immediate of a `[reg + imm]` address operand survives lowering
+    /// for the tensor-core memory ops. It used to be dropped, so
+    /// `ldmatrix ... [%r2+16]` loaded from `[%r2]` (issue #4).
+    #[test]
+    fn test_tensor_core_ops_keep_address_offset() {
+        assert_eq!(
+            lowered_tensor_offset(
+                "ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%r1, %r2, %r3, %r4}, [%r5+16];"
+            ),
+            16
+        );
+        // nvcc spells negative immediates `+-N`.
+        assert_eq!(
+            lowered_tensor_offset("ldmatrix.sync.aligned.x1.m8n8.shared.b16 {%r1}, [%r5+-32];"),
+            -32
+        );
+        assert_eq!(
+            lowered_tensor_offset("ldmatrix.sync.aligned.x1.m8n8.shared.b16 {%r1}, [%r5];"),
+            0
+        );
+        assert_eq!(
+            lowered_tensor_offset(
+                "wmma.load.a.sync.aligned.row.m16n16k16.shared.f16 \
+                 {%r0, %r1, %r2, %r3, %r4, %r5, %r6, %r7}, [%rd1+64], %r2;"
+            ),
+            64
+        );
+        assert_eq!(
+            lowered_tensor_offset(
+                "wmma.store.d.sync.aligned.row.m16n16k16.shared.f32 \
+                 [%rd1+128], {%f0, %f1, %f2, %f3, %f4, %f5, %f6, %f7}, %r2;"
+            ),
+            128
+        );
+    }
+
+    /// An address offset that is not a constant is rejected, not silently
+    /// read as `+0`.
+    #[test]
+    fn test_reject_non_constant_address_offset() {
+        for body in [
+            "ld.shared.u32 %r1, [%r2+bogus];",
+            "st.shared.u32 [%r2+bogus], %r1;",
+            "ldmatrix.sync.aligned.x1.m8n8.shared.b16 {%r1}, [%r2+bogus];",
+        ] {
+            match lower_body(body) {
+                Err(LowerError::InvalidOperand { reason, .. }) => {
+                    assert!(reason.contains("constant"), "{:?}: {}", body, reason);
+                }
+                other => panic!("expected InvalidOperand for {:?}, got {:?}", body, other),
+            }
+        }
+    }
+
+    /// A memory operand where a value is expected is rejected instead of
+    /// being read as its base register.
+    #[test]
+    fn test_reject_address_operand_in_value_position() {
+        assert_rejected("add.u32 %r1, %r2, [%r3+4];", "address operand");
     }
 
     #[test]

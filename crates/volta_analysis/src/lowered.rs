@@ -447,10 +447,13 @@ pub enum LoweredInstr {
     // =========================================================================
     // Tensor Core
     // =========================================================================
-    /// Cooperative matrix load from shared memory (ldmatrix.sync)
+    /// Cooperative matrix load from shared memory (ldmatrix.sync). Each
+    /// lane's row address is `base + offset`, the `[reg + imm]` operand
+    /// split the same way as `Load`'s.
     Ldmatrix {
         dst: Vec<RegId>,
-        addr: Operand,
+        base: Operand,
+        offset: i64,
         num: u32, // x1, x2, or x4
         trans: bool,
     },
@@ -476,7 +479,8 @@ pub enum LoweredInstr {
         shape: crate::tensor_core::MmaShape,
         layout: crate::tensor_core::MmaLayout,
         dst: Vec<RegId>,
-        addr: Operand,
+        base: Operand,
+        offset: i64,
         stride: Operand,
         elem_type: ScalarType,
         space: MemSpace,
@@ -487,7 +491,8 @@ pub enum LoweredInstr {
         shape: crate::tensor_core::MmaShape,
         layout: crate::tensor_core::MmaLayout,
         src: Vec<RegId>,
-        addr: Operand,
+        base: Operand,
+        offset: i64,
         stride: Operand,
         elem_type: ScalarType,
         space: MemSpace,
@@ -698,7 +703,7 @@ impl LoweredInstr {
             } => from_ops(&[*src, *offset_or_lane, *clamp, *membermask]),
 
             // Tensor core
-            Self::Ldmatrix { addr, .. } => from_op(addr).into_iter().collect(),
+            Self::Ldmatrix { base, .. } => from_op(base).into_iter().collect(),
             Self::Mma {
                 src_a,
                 src_b,
@@ -717,18 +722,18 @@ impl LoweredInstr {
                 r.extend(src_c.iter().copied());
                 r
             }
-            Self::WmmaLoad { addr, stride, .. } => {
+            Self::WmmaLoad { base, stride, .. } => {
                 let mut r = Vec::new();
-                r.extend(from_op(addr));
+                r.extend(from_op(base));
                 r.extend(from_op(stride));
                 r
             }
             Self::WmmaStore {
-                src, addr, stride, ..
+                src, base, stride, ..
             } => {
                 let mut r = Vec::new();
                 r.extend(src.iter().copied());
-                r.extend(from_op(addr));
+                r.extend(from_op(base));
                 r.extend(from_op(stride));
                 r
             }

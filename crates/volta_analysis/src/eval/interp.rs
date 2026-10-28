@@ -1196,7 +1196,15 @@ impl<'p> Interpreter<'p> {
         offset: i64,
     ) -> EvalResult<u64> {
         let base = self.concrete_operand(t, pc, base, "memory address")?;
-        Ok((base as u64).wrapping_add(offset as u64))
+        Ok(Self::offset_addr(base, offset))
+    }
+
+    /// `base + offset` for an already-concrete base: `effective_addr`'s
+    /// arithmetic (see its doc for the wrap semantics), shared with the
+    /// warp-cooperative loads/stores, which obtain their base per lane or
+    /// warp-uniformly before applying the instruction's offset.
+    pub(in crate::eval) fn offset_addr(base: i64, offset: i64) -> u64 {
+        (base as u64).wrapping_add(offset as u64)
     }
 
     /// Ownership containment: the region owning the access's *first byte*

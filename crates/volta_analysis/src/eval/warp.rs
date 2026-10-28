@@ -170,8 +170,14 @@ impl Interpreter<'_> {
                     clamp,
                 )?;
             }
-            LoweredInstr::Ldmatrix { dst, addr, num, .. } => {
-                self.exec_ldmatrix(pc, members, dst, addr, *num)?;
+            LoweredInstr::Ldmatrix {
+                dst,
+                base,
+                offset,
+                num,
+                ..
+            } => {
+                self.exec_ldmatrix(pc, members, dst, base, *offset, *num)?;
             }
             LoweredInstr::Mma { .. } => self.exec_mma(pc, members, &instr)?,
             LoweredInstr::WmmaLoad { .. } => self.exec_wmma_load(pc, members, &instr)?,
@@ -374,8 +380,8 @@ impl Interpreter<'_> {
 
     /// `ldmatrix.sync.aligned.xN.m8n8.shared.b16`: cooperative load of N
     /// 8x8 b16 matrices. Lane `i*8 + r` supplies the address of row `r` of
-    /// matrix `i`; lane `l` receives elements (row `l/4`, cols `(l%4)*2`,
-    /// `(l%4)*2+1`) of each matrix as a packed pair.
+    /// matrix `i` (its `base + offset`); lane `l` receives elements (row
+    /// `l/4`, cols `(l%4)*2`, `(l%4)*2+1`) of each matrix as a packed pair.
     ///
     /// `check_warp_op_preconditions` already established: no `.trans`, all
     /// 32 lanes live, `dst.len() == num`.
@@ -384,7 +390,8 @@ impl Interpreter<'_> {
         pc: InstrId,
         members: &[ThreadId],
         dst: &[RegId],
-        addr: &Operand,
+        base: &Operand,
+        offset: i64,
         num: u32,
     ) -> EvalResult<()> {
         // Row addresses come from the first num*8 lanes. Each row is loaded
@@ -394,7 +401,8 @@ impl Interpreter<'_> {
         for i in 0..num as usize {
             for r in 0..8 {
                 let m = members[i * 8 + r];
-                let a = self.concrete_operand(m, pc, addr, "ldmatrix row address")? as u64;
+                let a = self.concrete_operand(m, pc, base, "ldmatrix row address")?;
+                let a = Self::offset_addr(a, offset);
                 self.check_alignment(m, pc, MemSpace::Shared, a, LDMATRIX_ROW_BYTES)?;
                 row_addr[i][r] = a;
             }
@@ -473,7 +481,8 @@ impl Interpreter<'_> {
             operand,
             layout,
             dst,
-            addr,
+            base,
+            offset,
             stride,
             elem_type,
             space,
@@ -483,7 +492,8 @@ impl Interpreter<'_> {
             unreachable!()
         };
 
-        let base = self.uniform_concrete(pc, members, addr, "wmma.load address")? as u64;
+        let base = self.uniform_concrete(pc, members, base, "wmma.load address")?;
+        let base = Self::offset_addr(base, *offset);
         let stride = self.uniform_concrete(pc, members, stride, "wmma.load stride")?;
         let stride =
             self.check_wmma_addressing(pc, members[0], *space, base, stride, *elem_type)?;
@@ -575,7 +585,8 @@ impl Interpreter<'_> {
         let LoweredInstr::WmmaStore {
             layout,
             src,
-            addr,
+            base,
+            offset,
             stride,
             elem_type,
             space,
@@ -585,7 +596,8 @@ impl Interpreter<'_> {
             unreachable!()
         };
 
-        let base = self.uniform_concrete(pc, members, addr, "wmma.store address")? as u64;
+        let base = self.uniform_concrete(pc, members, base, "wmma.store address")?;
+        let base = Self::offset_addr(base, *offset);
         let stride = self.uniform_concrete(pc, members, stride, "wmma.store stride")?;
         let stride =
             self.check_wmma_addressing(pc, members[0], *space, base, stride, *elem_type)?;

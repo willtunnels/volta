@@ -4,6 +4,7 @@
 //! the Harris reduction kernels from the paper benchmarks (64-128 threads,
 //! ~100 instructions each) validate real equivalence checking.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use volta_analysis::driver::{EquivOutcome, analyze_kernel, check_output_equivalence};
@@ -788,6 +789,162 @@ fn test_wmma_stride_misaligned() {
         "expected misaligned wmma stride, got: {}",
         err
     );
+}
+
+/// The issue #4 reproducer, parametrized: thread 0 fills `sdata[0..16)`
+/// with one word and `sdata[16..32)` with another, then every lane loads
+/// an 8x8 b16 row through `ldmatrix.x1 ... [%r2+imm]` with
+/// `%r2 = sdata + reg`, and thread 0 exports lane 0's word. The lowering
+/// used to drop `imm`.
+fn ldmatrix_offset_body(reg: i64, imm: i64) -> String {
+    format!(
+        ".visible .entry k(
+    .param .u64 out_param
+)
+{{
+    .reg .pred %p<2>;
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<3>;
+    .shared .align 16 .b8 sdata[32];
+
+    mov.u32 %r1, %tid.x;
+    setp.eq.s32 %p1, %r1, 0;
+    mov.u32 %r2, sdata;
+    @%p1 mov.u32 %r3, 111111111;
+    @%p1 st.shared.u32 [%r2], %r3;
+    @%p1 mov.u32 %r4, 222222222;
+    @%p1 st.shared.u32 [%r2+16], %r4;
+    bar.sync 0;
+    add.s32 %r2, %r2, {};
+    ldmatrix.sync.aligned.x1.m8n8.shared.b16 {{%r5}}, [%r2+{}];
+    @%p1 ld.param.u64 %rd1, [out_param];
+    @%p1 cvta.to.global.u64 %rd1, %rd1;
+    @%p1 st.global.u32 [%rd1], %r5;
+    ret;
+}}
+",
+        reg, imm
+    )
+}
+
+/// `ldmatrix` applies the immediate of its `[reg + imm]` address operand:
+/// positive, nvcc's `+-N` negative spelling, and absent.
+#[test]
+fn test_ldmatrix_applies_address_offset() {
+    for (reg, imm, expected) in [
+        (0, 16, "222222222"),
+        (16, -16, "111111111"),
+        (0, 0, "111111111"),
+        (16, 0, "222222222"),
+    ] {
+        let module = parse(&wrap(&ldmatrix_offset_body(reg, imm)));
+        let mut config = out_only_config(4, 1);
+        config.block_dim = (32, 1, 1);
+        let out = analyze_kernel(&module, None, config)
+            .unwrap_or_else(|e| panic!("ldmatrix [%r2+{}] with %r2 = sdata+{}: {}", imm, reg, e));
+        assert_eq!(
+            display_output(&out, "out", 0),
+            expected,
+            "ldmatrix [%r2+{}] with %r2 = sdata+{}",
+            imm,
+            reg
+        );
+    }
+}
+
+/// `wmma.store` applies the immediate of its address operand: a d-fragment
+/// stored at `[out+64]` with the default stride lands on elements
+/// 16..272 of `out`, not 0..256.
+#[test]
+fn test_wmma_store_applies_address_offset() {
+    let module = parse(&wrap(
+        ".visible .entry k(
+    .param .u64 out_param
+)
+{
+    .reg .b32 %r<2>;
+    .reg .b64 %rd<2>;
+    .reg .f32 %f<9>;
+
+    ld.param.u64 %rd1, [out_param];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.f32 %f1, 0f3F800000;
+    mov.f32 %f2, 0f3F800000;
+    mov.f32 %f3, 0f3F800000;
+    mov.f32 %f4, 0f3F800000;
+    mov.f32 %f5, 0f3F800000;
+    mov.f32 %f6, 0f3F800000;
+    mov.f32 %f7, 0f3F800000;
+    mov.f32 %f8, 0f3F800000;
+    mov.u32 %r1, 16;
+    wmma.store.d.sync.aligned.row.m16n16k16.global.f32 \
+         [%rd1+64], {%f1, %f2, %f3, %f4, %f5, %f6, %f7, %f8}, %r1;
+    ret;
+}
+",
+    ));
+    let mut config = out_only_config(4, 272);
+    config.block_dim = (32, 1, 1);
+    let out = analyze_kernel(&module, None, config).expect("wmma.store with offset");
+    let (_, elems) = out
+        .outputs
+        .iter()
+        .find(|(n, _)| n == "out")
+        .expect("output array");
+    let written: Vec<u64> = elems.iter().map(|(i, _)| *i).collect();
+    assert_eq!(written, (16..272).collect::<Vec<u64>>());
+}
+
+/// `wmma.load` applies the immediate of its address operand: a c-fragment
+/// loaded from `[in+64]` with the default stride is exactly `in[16..272)`,
+/// one element per fragment register across the warp.
+#[test]
+fn test_wmma_load_applies_address_offset() {
+    let module = parse(&wrap(
+        ".visible .entry k(
+    .param .u64 in_param,
+    .param .u64 out_param
+)
+{
+    .reg .b32 %r<3>;
+    .reg .b64 %rd<5>;
+    .reg .f32 %f<9>;
+
+    ld.param.u64 %rd1, [in_param];
+    ld.param.u64 %rd2, [out_param];
+    cvta.to.global.u64 %rd1, %rd1;
+    cvta.to.global.u64 %rd2, %rd2;
+    mov.u32 %r1, 16;
+    wmma.load.c.sync.aligned.row.m16n16k16.global.f32 \
+         {%f1, %f2, %f3, %f4, %f5, %f6, %f7, %f8}, [%rd1+64], %r1;
+    mov.u32 %r2, %tid.x;
+    mul.wide.u32 %rd3, %r2, 32;
+    add.s64 %rd4, %rd2, %rd3;
+    st.global.f32 [%rd4], %f1;
+    st.global.f32 [%rd4+4], %f2;
+    st.global.f32 [%rd4+8], %f3;
+    st.global.f32 [%rd4+12], %f4;
+    st.global.f32 [%rd4+16], %f5;
+    st.global.f32 [%rd4+20], %f6;
+    st.global.f32 [%rd4+24], %f7;
+    st.global.f32 [%rd4+28], %f8;
+    ret;
+}
+",
+    ));
+    let out = analyze_kernel(&module, None, in_out_config(32, 272)).expect("wmma.load with offset");
+    let (_, elems) = out
+        .outputs
+        .iter()
+        .find(|(n, _)| n == "out")
+        .expect("output array");
+    assert_eq!(elems.len(), 256);
+    let loaded: BTreeSet<String> = elems
+        .iter()
+        .map(|(_, e)| out.arena.display_expr(*e))
+        .collect();
+    let expected: BTreeSet<String> = (16..272).map(|i| format!("in[{}]", i)).collect();
+    assert_eq!(loaded, expected);
 }
 
 /// An array base that is not a multiple of the element width is rejected
