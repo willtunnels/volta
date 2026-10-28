@@ -34,6 +34,16 @@ pub enum ParseErrorKind {
     InvalidType(AsciiString),
     InvalidStateSpace(AsciiString),
     InvalidStateSpaceQualifier(AsciiString),
+    InvalidPtrSpace(AsciiString),
+    /// `.ptr` on a `.func` parameter; the ISA defines it for kernel
+    /// (`.entry`) parameters only.
+    PtrOnDeviceFunctionParam,
+    /// `.ptr` on a parameter that cannot hold an address: not a scalar
+    /// 32/64-bit integer type, or a byte array.
+    PtrOnNonPointerType {
+        ty: Type,
+        array_dims: Vec<u32>,
+    },
     ExpectedStateSpace(Option<Token>),
     ExpectedType(Option<Token>),
     ExpectedScalarType(Option<Token>),
@@ -70,6 +80,9 @@ impl ParseErrorKind {
             ParseErrorKind::InvalidType(_) => "Invalid Type",
             ParseErrorKind::InvalidStateSpace(_) => "Invalid State Space",
             ParseErrorKind::InvalidStateSpaceQualifier(_) => "Invalid State Space Qualifier",
+            ParseErrorKind::InvalidPtrSpace(_) => "Invalid Pointer Space",
+            ParseErrorKind::PtrOnDeviceFunctionParam => "Pointer Attribute On Device Function",
+            ParseErrorKind::PtrOnNonPointerType { .. } => "Pointer Attribute On Non-Pointer Type",
             ParseErrorKind::ExpectedStateSpace(_) => "Expected State Space",
             ParseErrorKind::ExpectedType(_) => "Expected Type",
             ParseErrorKind::ExpectedScalarType(_) => "Expected Scalar Type",
@@ -116,6 +129,28 @@ impl ParseErrorKind {
             ParseErrorKind::InvalidStateSpace(name) => format!("Invalid state space: .{}", name),
             ParseErrorKind::InvalidStateSpaceQualifier(name) => {
                 format!("Invalid state space qualifier: .{}", name)
+            }
+            ParseErrorKind::InvalidPtrSpace(name) => format!(
+                "Invalid pointer space: .{} (expected one of .const, .global, .local, .shared)",
+                name
+            ),
+            ParseErrorKind::PtrOnDeviceFunctionParam => {
+                ".ptr is a kernel (.entry) parameter attribute; .func parameters cannot carry it"
+                    .to_string()
+            }
+            ParseErrorKind::PtrOnNonPointerType { ty, array_dims } => {
+                let vec = ty
+                    .vec
+                    .map(|v| format!(".{:?}", v).to_lowercase())
+                    .unwrap_or_default();
+                let dims: String = array_dims.iter().map(|d| format!("[{}]", d)).collect();
+                format!(
+                    ".ptr requires a scalar 32- or 64-bit integer parameter \
+                     (.u32/.u64/.s32/.s64/.b32/.b64), found {}.{}{}",
+                    vec,
+                    format!("{:?}", ty.scalar).to_lowercase(),
+                    dims
+                )
             }
             ParseErrorKind::ExpectedStateSpace(found) => match found {
                 Some(tok) => format!("Expected state space, found {}", tok),
@@ -184,6 +219,32 @@ impl ParseErrorKind {
             ParseErrorKind::LexerError(e) => format!("Invalid character at position {}", e.0),
         })
     }
+}
+
+/// Whether a function is a kernel entry point or a device function. Some
+/// parameter syntax is kernel-only: the `.ptr` attribute (ISA 5.1.6.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FunctionKind {
+    Entry,
+    Device,
+}
+
+/// Whether a parameter of type `ty` with these array dimensions can hold an
+/// address, i.e. may carry the `.ptr` attribute: a scalar 32- or 64-bit
+/// integer (the ISA's examples use `.u32`/`.u64`), never a float, a
+/// predicate, a sub-word type, a vector, or a byte array.
+fn is_pointer_param(ty: &Type, array_dims: &[u32]) -> bool {
+    array_dims.is_empty()
+        && ty.vec.is_none()
+        && matches!(
+            ty.scalar,
+            ScalarType::U32
+                | ScalarType::U64
+                | ScalarType::S32
+                | ScalarType::S64
+                | ScalarType::B32
+                | ScalarType::B64
+        )
 }
 
 /// Helper to create a located error at a specific span.
@@ -623,11 +684,15 @@ impl<'a> Parser<'a> {
                 match s.as_bytes() {
                     b"entry" => {
                         self.next().unwrap();
-                        Ok(TopLevelItem::Entry(self.parse_function(linkage)?))
+                        Ok(TopLevelItem::Entry(
+                            self.parse_function(linkage, FunctionKind::Entry)?,
+                        ))
                     }
                     b"func" => {
                         self.next().unwrap();
-                        Ok(TopLevelItem::Function(self.parse_function(linkage)?))
+                        Ok(TopLevelItem::Function(
+                            self.parse_function(linkage, FunctionKind::Device)?,
+                        ))
                     }
                     b"file" => {
                         self.next().unwrap();
@@ -875,6 +940,42 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse the optional kernel-parameter pointer attribute
+    /// `.ptr [.space] [.align N]` (PTX ISA 5.1.6.3). The ISA's compact
+    /// spelling `.ptr.global.align 16` lexes to the same tokens as the
+    /// spaced form. A missing space is a generic address and a missing
+    /// alignment is the ISA's 4-byte assumption, so the result is a
+    /// complete `Ptr`. Kernel-only: `.func` parameters are rejected.
+    fn parse_ptr_attribute(&mut self, kind: FunctionKind) -> Result<Option<Ptr>, ParseError> {
+        let Some((ptr_span, _)) = self.peek()? else {
+            return Ok(None);
+        };
+        if !self.try_directive(ascii("ptr"))? {
+            return Ok(None);
+        }
+        if kind == FunctionKind::Device {
+            return err_at(ptr_span, ParseErrorKind::PtrOnDeviceFunctionParam);
+        }
+
+        let space = match self.peek()? {
+            Some((span, Token::DottedIdent(DottedIdent::Simple(s)))) => {
+                if let Some(space) = PtrSpace::from_ascii(s) {
+                    self.next().unwrap();
+                    space
+                } else if s.as_slice() == ascii("align") {
+                    PtrSpace::Generic
+                } else {
+                    return err_at(span, ParseErrorKind::InvalidPtrSpace(s.clone()));
+                }
+            }
+            _ => PtrSpace::Generic,
+        };
+
+        let align = self.parse_align()?.unwrap_or(Ptr::DEFAULT_ALIGN);
+
+        Ok(Some(Ptr { space, align }))
+    }
+
     /// Parse a scalar type like `.f32`, `.s64`, etc.
     fn parse_scalar_type(&mut self) -> Result<ScalarType, ParseError> {
         match self.next()? {
@@ -992,10 +1093,14 @@ impl<'a> Parser<'a> {
     // =========================================================================
 
     /// Parse a function or entry definition.
-    fn parse_function(&mut self, linkage: Linkage) -> Result<Function, ParseError> {
+    fn parse_function(
+        &mut self,
+        linkage: Linkage,
+        kind: FunctionKind,
+    ) -> Result<Function, ParseError> {
         // Parse optional return parameters: `(.param .b32 retval)`
         let return_params = if self.peek_tok()? == Some(&Token::LeftParen) {
-            self.parse_param_list()?
+            self.parse_param_list(kind)?
         } else {
             Vec::new()
         };
@@ -1004,7 +1109,7 @@ impl<'a> Parser<'a> {
         let (name_span, name) = self.parse_ident_with_span()?;
 
         // Parse input parameters
-        let params = self.parse_param_list()?;
+        let params = self.parse_param_list(kind)?;
 
         // Parse performance-tuning directives (.maxntid, .minnctapersm, etc.)
         let perf_directives = self.parse_perf_directives()?;
@@ -1031,15 +1136,15 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse parameter list `(.param .u64 ptr, .param .u32 n)`.
-    fn parse_param_list(&mut self) -> Result<Vec<Parameter>, ParseError> {
+    fn parse_param_list(&mut self, kind: FunctionKind) -> Result<Vec<Parameter>, ParseError> {
         self.expect(Token::LeftParen)?;
 
         let mut params = Vec::new();
         if self.peek_tok()? != Some(&Token::RightParen) {
-            params.push(self.parse_parameter()?);
+            params.push(self.parse_parameter(kind)?);
             while self.peek_tok()? == Some(&Token::Comma) {
                 self.next().unwrap();
-                params.push(self.parse_parameter()?);
+                params.push(self.parse_parameter(kind)?);
             }
         }
 
@@ -1048,13 +1153,14 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a single parameter.
-    fn parse_parameter(&mut self) -> Result<Parameter, ParseError> {
+    fn parse_parameter(&mut self, kind: FunctionKind) -> Result<Parameter, ParseError> {
         // Get start span
         let start = self.peek()?.map(|(s, _)| s.0).unwrap_or(0);
 
         let (space, _) = self.parse_state_space()?;
         let align = self.parse_align()?;
         let ty = self.parse_type()?;
+        let ptr = self.parse_ptr_attribute(kind)?;
         let (name_span, name) = self.parse_ident_with_span()?;
 
         // Parse array dimensions for byte arrays
@@ -1070,11 +1176,19 @@ impl<'a> Parser<'a> {
             array_dims.push(size);
         }
 
+        if ptr.is_some() && !is_pointer_param(&ty, &array_dims) {
+            return err_at(
+                Span(start, end),
+                ParseErrorKind::PtrOnNonPointerType { ty, array_dims },
+            );
+        }
+
         Ok(Parameter {
             span: Span(start, end),
             space,
             align,
             ty,
+            ptr,
             name: name.into_inner(),
             array_dims,
         })
@@ -2605,6 +2719,102 @@ mod tests {
         }
     }
 
+    /// A kernel whose parameter list is `params`.
+    fn kernel_with_params(params: &str) -> Vec<u8> {
+        format!(
+            ".version 7.0\n.target sm_70\n.address_size 64\n\n\
+             .visible .entry k({})\n{{\n    ret;\n}}\n",
+            params
+        )
+        .into_bytes()
+    }
+
+    /// `.ptr` resolves to a complete contract: a missing `.space` is a
+    /// generic address, a missing `.align` is the ISA's 4-byte assumption,
+    /// and the ISA's compact spelling without spaces is the same attribute.
+    #[test]
+    fn test_parse_ptr_attribute_forms() {
+        let src = kernel_with_params(
+            "
+    .param .u64 .ptr .global .align 16 a,
+    .param .u64 .ptr .align 8 b,
+    .param .u64 .ptr .shared c,
+    .param .u64 .ptr d,
+    .param .u32 .ptr.const.align 8 e,
+    .param .b64 .ptr .local .align 1 f,
+    .param .u64 g
+",
+        );
+        let module = parse_module(&src).unwrap();
+        let TopLevelItem::Entry(func) = &module.items[0] else {
+            panic!("Expected Entry");
+        };
+        let ptr = |i: usize| func.params[i].ptr;
+        let contract = |space, align| Some(Ptr { space, align });
+        assert_eq!(ptr(0), contract(PtrSpace::Global, 16));
+        assert_eq!(ptr(1), contract(PtrSpace::Generic, 8));
+        assert_eq!(ptr(2), contract(PtrSpace::Shared, Ptr::DEFAULT_ALIGN));
+        assert_eq!(ptr(3), contract(PtrSpace::Generic, Ptr::DEFAULT_ALIGN));
+        assert_eq!(ptr(4), contract(PtrSpace::Const, 8));
+        assert_eq!(ptr(5), contract(PtrSpace::Local, 1));
+        assert_eq!(ptr(6), None);
+    }
+
+    /// The `.ptr` rejections: an unknown space, a non-power-of-two
+    /// alignment, a device-function parameter (input or return), and a
+    /// parameter type that cannot hold an address.
+    #[test]
+    fn test_reject_invalid_ptr_attributes() {
+        let err = |src: &[u8]| parse_module(src).unwrap_err().error;
+
+        assert!(matches!(
+            err(&kernel_with_params(".param .u64 .ptr .param x")),
+            ParseErrorKind::InvalidPtrSpace(ref s) if s.as_str() == "param"
+        ));
+        assert_eq!(
+            err(&kernel_with_params(".param .u64 .ptr .global .align 3 x")),
+            ParseErrorKind::InvalidAlignment(3)
+        );
+
+        let header = ".version 7.0\n.target sm_70\n.address_size 64\n\n";
+        for func in [
+            ".func f(.param .u64 .ptr .global p)\n{\n    ret;\n}\n",
+            ".func (.param .u64 .ptr r) f()\n{\n    ret;\n}\n",
+        ] {
+            assert_eq!(
+                err(format!("{}{}", header, func).as_bytes()),
+                ParseErrorKind::PtrOnDeviceFunctionParam,
+                "{}",
+                func
+            );
+        }
+
+        for param in [
+            ".param .f32 .ptr x",
+            ".param .u16 .ptr x",
+            ".param .pred .ptr x",
+            ".param .v2.u64 .ptr x",
+            ".param .align 8 .b64 .ptr x[2]",
+        ] {
+            assert!(
+                matches!(
+                    err(&kernel_with_params(param)),
+                    ParseErrorKind::PtrOnNonPointerType { .. }
+                ),
+                "{}",
+                param
+            );
+        }
+        for param in [
+            ".param .u32 .ptr x",
+            ".param .s64 .ptr x",
+            ".param .b32 .ptr x",
+        ] {
+            parse_module(&kernel_with_params(param))
+                .unwrap_or_else(|e| panic!("{}: {:?}", param, e.error));
+        }
+    }
+
     #[test]
     fn test_parse_entry_with_params() {
         let src = b".version 7.0
@@ -2613,7 +2823,7 @@ mod tests {
 
 .visible .entry add_kernel(
     .param .u64 in_a,
-    .param .u64 in_b,
+    .param .u64 .ptr .global .align 16 in_b,
     .param .u32 n
 )
 {
@@ -2628,6 +2838,16 @@ mod tests {
                 assert_eq!(func.params.len(), 3);
                 assert_eq!(func.params[0].name.as_str(), "in_a");
                 assert_eq!(func.params[0].ty.scalar, ScalarType::U64);
+                assert_eq!(func.params[0].ptr, None);
+                assert_eq!(func.params[1].name.as_str(), "in_b");
+                assert_eq!(func.params[1].ty.scalar, ScalarType::U64);
+                assert_eq!(
+                    func.params[1].ptr,
+                    Some(Ptr {
+                        space: PtrSpace::Global,
+                        align: 16,
+                    })
+                );
                 assert_eq!(func.params[2].name.as_str(), "n");
                 assert_eq!(func.params[2].ty.scalar, ScalarType::U32);
             }

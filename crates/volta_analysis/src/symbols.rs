@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use id_collections::{IdVec, id_type};
-use volta_frontend::ast::ScalarType;
+use volta_frontend::ast::{Ptr, ScalarType};
 
 use crate::lower_error::{LowerError, LowerResult};
 use crate::lowered::InstrId;
@@ -234,6 +234,10 @@ pub struct ParamInfo {
     pub name: String,
     pub ty: ScalarType,
     pub size_bytes: u64,
+    /// The `.ptr` attribute when the kernel declares one (Triton does,
+    /// nvcc does not): the contract `Interpreter::new` checks the config's
+    /// binding against.
+    pub ptr: Option<Ptr>,
 }
 
 /// Information about a shared memory allocation
@@ -465,6 +469,7 @@ impl SymbolTable {
         name: &str,
         ty: ScalarType,
         size_bytes: u64,
+        ptr: Option<Ptr>,
     ) -> LowerResult<ParamId> {
         self.reserve_name(name, SymbolKind::Parameter)?;
 
@@ -474,6 +479,7 @@ impl SymbolTable {
             name: name.to_string(),
             ty,
             size_bytes,
+            ptr,
         };
         self.params.insert(name.to_string(), info.clone());
         let _ = self.params_ordered.push(info);
@@ -943,10 +949,12 @@ mod tests {
     #[test]
     fn test_duplicate_param_error() {
         let mut symbols = SymbolTable::new();
-        symbols.declare_param("ptr", ScalarType::U64, 8).unwrap();
+        symbols
+            .declare_param("ptr", ScalarType::U64, 8, None)
+            .unwrap();
 
         // Try to declare same param again
-        let result = symbols.declare_param("ptr", ScalarType::U64, 8);
+        let result = symbols.declare_param("ptr", ScalarType::U64, 8, None);
         assert!(result.is_err());
     }
 
@@ -1195,7 +1203,9 @@ mod tests {
     fn test_label_conflicts_with_param() {
         use id_collections::Id;
         let mut symbols = SymbolTable::new();
-        symbols.declare_param("foo", ScalarType::U64, 8).unwrap();
+        symbols
+            .declare_param("foo", ScalarType::U64, 8, None)
+            .unwrap();
 
         // Label should conflict with param
         let result = symbols.declare_label("foo", InstrId::from_index(0));
@@ -1232,14 +1242,16 @@ mod tests {
         symbols.declare_register("foo", ScalarType::U32, 1).unwrap();
 
         // Param should conflict with register
-        let result = symbols.declare_param("foo", ScalarType::U64, 8);
+        let result = symbols.declare_param("foo", ScalarType::U64, 8, None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_shared_conflicts_with_param() {
         let mut symbols = SymbolTable::new();
-        symbols.declare_param("foo", ScalarType::U64, 8).unwrap();
+        symbols
+            .declare_param("foo", ScalarType::U64, 8, None)
+            .unwrap();
 
         // Shared should conflict with param
         let result = symbols.declare_shared("foo", ScalarType::U32, 256, false, 4);

@@ -8,7 +8,7 @@
 
 use id_collections::IdVec;
 
-use volta_frontend::ast::ScalarType;
+use volta_frontend::ast::{PtrSpace, ScalarType};
 
 use crate::eval::config::{AnalysisConfig, ParamValue};
 use crate::eval::error::{EvalError, EvalResult};
@@ -21,7 +21,7 @@ use crate::lowered::{
     BinOp, Clamp, CmpOp, InstrId, LoweredInstr, LoweredProgram, MemSpace, Operand, UnaryOp,
 };
 use crate::symbolic::{ExprArena, ExprId, Real, StringId};
-use crate::symbols::{MODULE_GLOBAL_BASE, ParamId, RegId, SpecialRegKind};
+use crate::symbols::{MODULE_GLOBAL_BASE, ParamId, ParamInfo, RegId, SpecialRegKind};
 use crate::types::ScalarTypeExt;
 
 /// Per-array output footprint: `(array name, [(element index, value)])`.
@@ -134,6 +134,65 @@ pub struct Interpreter<'p> {
     pub(in crate::eval) op_counts: [u64; crate::lowered::KIND_COUNT],
 }
 
+/// Check a config value against the kernel's declaration of the parameter
+/// it binds. nvcc leaves parameters unattributed, so an unattributed
+/// parameter accepts any value (an array pointer included). A `.ptr`
+/// attribute (Triton emits one on every pointer argument) is a contract
+/// the config must honor: the value must be an array pointer; config
+/// arrays live in global memory, so the declared space must admit a
+/// global address; and the array's base must carry the declared
+/// alignment, which ptxas is entitled to have exploited.
+fn check_param_binding(
+    index: usize,
+    info: &ParamInfo,
+    value: &ParamValue,
+    config: &AnalysisConfig,
+) -> EvalResult<()> {
+    let Some(ptr) = info.ptr else {
+        return Ok(());
+    };
+    let config_err = |message: String| EvalError::Config { message };
+    let array_name = match value {
+        ParamValue::ArrayPtr(name) => name,
+        other => {
+            let bound = match other {
+                ParamValue::Int(v) => format!("the integer {}", v),
+                ParamValue::Float(v) => format!("the float {}", v),
+                ParamValue::SymFloat(name) => format!("the symbolic float '{}'", name),
+                ParamValue::ArrayPtr(_) => unreachable!(),
+            };
+            return Err(config_err(format!(
+                "parameter {} '{}' is declared .ptr (a pointer) but the config binds {}; \
+                 bind an array to it (ptr:<array>)",
+                index, info.name, bound
+            )));
+        }
+    };
+    match ptr.space {
+        PtrSpace::Global | PtrSpace::Generic => {}
+        PtrSpace::Const | PtrSpace::Local | PtrSpace::Shared => {
+            return Err(config_err(format!(
+                "parameter {} '{}' is declared .ptr {}, a pointer into {} memory, but config \
+                 arrays live in global memory; only .global and generic pointer parameters \
+                 can be bound to an array",
+                index, info.name, ptr.space, ptr.space
+            )));
+        }
+    }
+    // An unknown array name is reported by the binding itself.
+    if let Some(array) = config.array(array_name)
+        && array.base % u64::from(ptr.align) != 0
+    {
+        return Err(config_err(format!(
+            "the kernel declares parameter {} '{}' as a pointer to {}-byte-aligned memory \
+             (.ptr .align {}; the ISA assumes 4 when .align is absent) but the bound array \
+             '{}' is based at {:#x}",
+            index, info.name, ptr.align, ptr.align, array_name, array.base
+        )));
+    }
+    Ok(())
+}
+
 impl<'p> Interpreter<'p> {
     pub fn new(program: &'p LoweredProgram, config: AnalysisConfig) -> EvalResult<Self> {
         let n_threads = config.num_threads();
@@ -162,7 +221,8 @@ impl<'p> Interpreter<'p> {
             });
         }
         let mut params: IdVec<ParamId, Value> = IdVec::new();
-        for value in &config.params {
+        for (index, (info, value)) in declared.values().zip(&config.params).enumerate() {
+            check_param_binding(index, info, value, &config)?;
             let v = match value {
                 ParamValue::Int(v) => Value::Scalar(arena.int(*v)),
                 // Exact ingestion; NaN was rejected by `config.validate()`

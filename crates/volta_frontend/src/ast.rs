@@ -403,6 +403,65 @@ pub struct Type {
     pub scalar: ScalarType,
 }
 
+/// The `.ptr` kernel-parameter attribute: the state space and alignment of
+/// the memory a pointer parameter points to (PTX ISA 5.1.6.3,
+/// `.param .type .ptr [.space] [.align N] name`).
+///
+/// Both parts may be omitted in the syntax, but neither is optional in
+/// meaning. Without `.space` "the pointer is assumed to be a generic
+/// address pointing to one of const, global, local, or shared memory";
+/// without `.align` "the memory pointed to is assumed to be aligned to a
+/// 4 byte boundary". The parser resolves both, so a `Ptr` is always a
+/// complete contract that a launch configuration can be checked against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ptr {
+    pub space: PtrSpace,
+    /// Guaranteed alignment of the pointed-to memory in bytes: a power of
+    /// two, `Ptr::DEFAULT_ALIGN` when the attribute names none.
+    pub align: u32,
+}
+
+impl Ptr {
+    /// The ISA's alignment assumption for a `.ptr` attribute without `.align`.
+    pub const DEFAULT_ALIGN: u32 = 4;
+}
+
+/// State space of the memory a `.ptr` parameter points to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PtrSpace {
+    /// No `.space` given: a generic address into any of the spaces below.
+    Generic,
+    Const,
+    Global,
+    Local,
+    Shared,
+}
+
+impl std::fmt::Display for PtrSpace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            PtrSpace::Generic => "generic",
+            PtrSpace::Const => ".const",
+            PtrSpace::Global => ".global",
+            PtrSpace::Local => ".local",
+            PtrSpace::Shared => ".shared",
+        })
+    }
+}
+
+/// The explicit `.space` spellings; `Generic` is the absence of one.
+impl FromAscii for PtrSpace {
+    fn from_ascii(s: &[AsciiChar]) -> Option<Self> {
+        Some(match s.as_bytes() {
+            b"const" => PtrSpace::Const,
+            b"global" => PtrSpace::Global,
+            b"local" => PtrSpace::Local,
+            b"shared" => PtrSpace::Shared,
+            _ => return None,
+        })
+    }
+}
+
 // =============================================================================
 // State Spaces
 // =============================================================================
@@ -583,6 +642,8 @@ pub struct Parameter {
     pub space: StateSpace,
     pub align: Option<u32>,
     pub ty: Type,
+    /// Optional pointer attribute for pointer parameters
+    pub ptr: Option<Ptr>,
     pub name: AsciiString,
     /// Array dimensions for byte-array parameters
     pub array_dims: Vec<u32>,

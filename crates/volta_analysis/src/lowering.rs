@@ -979,7 +979,7 @@ fn collect_declarations(
         let ty = param.ty.scalar;
         let size_bytes = ty.size_bytes() as u64;
         ctx.symbols
-            .declare_param(&param.name.to_string(), ty, size_bytes)?;
+            .declare_param(&param.name.to_string(), ty, size_bytes, param.ptr)?;
     }
 
     // Collect declarations from body
