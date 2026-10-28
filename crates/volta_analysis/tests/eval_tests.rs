@@ -790,6 +790,101 @@ fn test_wmma_stride_misaligned() {
     );
 }
 
+/// A kernel whose one parameter carries `attr` (e.g. `.ptr .global
+/// .align 16`) and stores through it Triton-style: straight from
+/// `ld.param`, without `cvta`.
+fn ptr_param_kernel(attr: &str) -> String {
+    wrap(&format!(
+        ".visible .entry k(
+    .param .u64 {} out_param
+)
+{{
+    .reg .b32 %r<2>;
+    .reg .b64 %rd<2>;
+
+    ld.param.u64 %rd1, [out_param];
+    mov.u32 %r1, 7;
+    st.global.u32 [%rd1], %r1;
+    ret;
+}}
+",
+        attr
+    ))
+}
+
+/// One output array `out` at `base` bound to the kernel's parameter as
+/// `value`.
+fn ptr_param_config(base: u64, elem_width: u64, value: ParamValue) -> AnalysisConfig {
+    let mut config = AnalysisConfig::new((1, 1, 1));
+    config.arrays = vec![ArrayDef {
+        name: "out".to_string(),
+        base,
+        elem_width,
+        len: 4,
+        kind: ArrayKind::Output,
+    }];
+    config.params = vec![value];
+    config
+}
+
+/// The config error message `src` produces under `config`.
+fn config_error(src: &str, config: AnalysisConfig) -> String {
+    match analyze_kernel(&parse(src), None, config) {
+        Err(AnalysisError::Eval(EvalError::Config { message })) => message,
+        other => panic!("expected a config error, got {:?}", other.map(|_| ())),
+    }
+}
+
+/// A `.ptr` attribute is a contract on the launch config: the value must
+/// be an array pointer, the declared space must admit global memory
+/// (where config arrays live), and the array base must have the declared
+/// alignment, 4 bytes when `.align` is absent (the ISA's assumption).
+/// Unattributed parameters (nvcc) keep accepting anything.
+#[test]
+fn test_ptr_param_contract_is_checked_against_config() {
+    let out = || ParamValue::ArrayPtr("out".to_string());
+
+    for attr in [".ptr .global .align 16", ".ptr .align 8", ".ptr", ""] {
+        let config = ptr_param_config(0x20000, 4, out());
+        let result = analyze_kernel(&parse(&ptr_param_kernel(attr)), None, config)
+            .unwrap_or_else(|e| panic!("{:?}: {}", attr, e));
+        assert_eq!(display_output(&result, "out", 0), "7", "{:?}", attr);
+    }
+
+    // Declared alignment violated: 0x20008 is 8- but not 16-byte aligned.
+    let msg = config_error(
+        &ptr_param_kernel(".ptr .global .align 16"),
+        ptr_param_config(0x20008, 4, out()),
+    );
+    assert!(msg.contains("16-byte-aligned"), "{}", msg);
+    // No .align means 4: a u16 array based at 0x20002 violates it.
+    let msg = config_error(
+        &ptr_param_kernel(".ptr .global"),
+        ptr_param_config(0x20002, 2, out()),
+    );
+    assert!(msg.contains("4-byte-aligned"), "{}", msg);
+    // The same base is fine for an unattributed parameter (no contract).
+    analyze_kernel(
+        &parse(&ptr_param_kernel("")),
+        None,
+        ptr_param_config(0x20008, 4, out()),
+    )
+    .expect("unattributed parameter has no alignment contract");
+
+    // A pointer parameter bound to a plain integer.
+    let msg = config_error(
+        &ptr_param_kernel(".ptr .global"),
+        ptr_param_config(0x20000, 4, ParamValue::Int(0x20000)),
+    );
+    assert!(msg.contains("ptr:<array>"), "{}", msg);
+    // A pointer into shared memory cannot be bound to a (global) array.
+    let msg = config_error(
+        &ptr_param_kernel(".ptr .shared"),
+        ptr_param_config(0x20000, 4, out()),
+    );
+    assert!(msg.contains(".shared"), "{}", msg);
+}
+
 /// An array base that is not a multiple of the element width is rejected
 /// when the analysis is configured, not per access.
 #[test]

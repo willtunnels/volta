@@ -66,6 +66,11 @@ Pratt parser producing AST. Entry point: `parse_module()`.
 - `Function` - Kernel/device function with params and body
 - `Instruction` - Generic instruction: the trie already resolves the mnemonic to a typed `InstrKind` at parse time (`InstructionOp::Unparsed { kind, modifiers, operands }`)
 - `ScalarType` - Pred, Signed/Unsigned/Float/Bits with width
+- `Parameter.ptr: Option<Ptr>` - the `.ptr` kernel-parameter attribute
+  (ISA 5.1.6.3; Triton emits it, nvcc does not) as a complete contract:
+  `PtrSpace` (with `Generic` for no `.space`) + alignment (the ISA's 4-byte
+  default when `.align` is absent). Kernel-only and only on scalar 32/64-bit
+  integer parameters; the parser rejects anything else
 
 ### Instruction Parsing (`instr.rs`, `instr_parse.rs`)
 
@@ -144,7 +149,7 @@ The interpreter from the paper (per-thread round-robin symbolic execution):
 - `eval/memory.rs` - byte-addressed granule memory; 4-byte reads combine two 2-byte granules into a `Pair`, 2-byte accesses split `Pair` granules; program writes are `dirty` (the output footprint)
 - `eval/race.rs` - χ-context race detection per byte (paper Section 3.2); full-CTA barrier sync is a wholesale clear
 - `eval/warp.rs` - warp-cooperative ops (`bar.warp.sync`, `shfl.sync`, `ldmatrix`, `mma.sync`, `wmma.*`): block until all *live* mask lanes converge at the pc (exited lanes count as arrived), sync χ over the full mask (exited lanes included), execute via the `tensor_core.rs` fragment tables with exact per-lane access attribution; a shfl source lane that exited yields `Undefined` data, while the tensor-core ops reject exited lanes loudly (the ISA defines them as UB "if any thread in the warp has exited")
-- `eval/config.rs` - `AnalysisConfig`: launch dims, positional `ParamValue`s (int/float/symbolic-float/array-pointer), `ArrayDef`s (`Input`/`Output`/`InputOutput`/`IndexInput`), module-global values, dynamic shared size
+- `eval/config.rs` - `AnalysisConfig`: launch dims, positional `ParamValue`s (int/float/symbolic-float/array-pointer), `ArrayDef`s (`Input`/`Output`/`InputOutput`/`IndexInput`), module-global values, dynamic shared size. `Interpreter::new` checks each binding against the kernel's `.ptr` attribute (carried in `symbols::ParamInfo`): a `.ptr` parameter must be bound to an array, its space must admit global memory (`.global` or generic), and the array base must have the declared alignment; unattributed parameters accept anything
 - `eval/error.rs` - `EvalError`: `DataRace`, `Deadlock`, `NotConcrete`, `OutOfBounds`, `UndefinedOutput`, `TrapReached`, etc.
 
 Key semantics: input-array symbols materialize lazily on first read; reads of
